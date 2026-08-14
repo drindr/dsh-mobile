@@ -43,7 +43,7 @@ dsh plugin --profile web add link:E:/dev/dsh-mobile
 ## 开发
 
 ```sh
-pnpm install        # devDeps link 到 ../dsh2026/deepseek-harness（DSH 源码，需先构建其 client 包）
+pnpm install        # devDeps: @deepseek-ai/dsh-client-* 取 npm registry（^0.1.0-rc.6，与发行版对齐），无本机路径
 pnpm run check      # typecheck + test + build
 ```
 
