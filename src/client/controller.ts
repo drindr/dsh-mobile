@@ -30,6 +30,15 @@ export type MobilePage = 'sidebar' | 'chat'
 /** Wait after the last scroll event before the pager settles. */
 const SCROLL_SETTLE_MS = 200
 
+/** After a session-row tap, wait this long for the app's own onClick to
+ *  switch the session before the plugin opens it itself (a tap the browser
+ *  swallowed — scroll suppression, drag-gesture disambiguation — must still
+ *  switch on the FIRST tap). */
+const TAP_SUPPLEMENT_MS = 150
+
+/** Pointer movement (px) above which a pointerup is a swipe, not a tap. */
+const TAP_SLOP = 12
+
 /** The sidebar shell's collapse toggle labels (zh / en) — clicking it while
  *  the sidebar is expanded must NOT collapse it to the rail (which would
  *  unload its content); it flips back to the chat page instead. */
@@ -57,21 +66,26 @@ function findFrame(): HTMLElement | null {
   return document.querySelector<HTMLElement>(FRAME_SELECTOR)
 }
 
-/**
- * The pager's chat-page snap position: the rendered width of the sidebar
- * page column (the always-open card). Falls back to the frame's own width
- * while the layout has not settled (offsetWidth is 0 before first layout).
- */
-function chatPageLeft(frame: HTMLElement): number {
-  const sidebar = frame.firstElementChild
-  if (sidebar instanceof HTMLElement && sidebar.offsetWidth > 0) return sidebar.offsetWidth
-  return frame.clientWidth
+/** Measurement cache entry for the chat-page snap position (see #chatPageLeft). */
+interface ChatLeftCache {
+  /** The frame the measurement belongs to (re-measure when it is replaced). */
+  frame: HTMLElement
+  /** The measured sidebar column width (px). */
+  left: number
 }
 
 /** Callbacks the controller needs from the apply world. */
 export interface MobileControllerOptions {
   /** Toggle the sidebar panel (frame-owned layout action). */
   toggleSidebar: () => void
+  /** Open a session by id (the app sessions service). Used to guarantee a
+   *  session-row tap switches even when the browser swallows the click. */
+  openSession?: (sessionId: string) => void
+  /** Resolve the session id whose title appears in a tapped row's text
+   *  (title matching against the sessions list snapshot). */
+  resolveSessionId?: (rowText: string) => string | undefined
+  /** The currently selected session id (sessions list snapshot). */
+  currentSessionId?: () => string | undefined
 }
 
 /** Test-facing surface of the controller (the class keeps everything else private). */
@@ -99,7 +113,20 @@ export class MobileController implements MobileControllerHandle {
   #mountFrame: number | null = null
   #resizeTimer: number | null = null
   #settleTimer: number | null = null
+  /** Pointer-down position for tap-vs-swipe discrimination. */
+  #pointerDownPos: { x: number; y: number } | null = null
+  /** Pending session-open supplement timers (cleared on dispose). */
+  #supplementTimers = new Set<number>()
   #expandPending = false
+  /** Cached chat-page snap position (measure once per stable layout, never
+   *  inside a scroll handler — reading offsetWidth there forces layout). */
+  #chatLeftCache: ChatLeftCache | null = null
+  /** Flip vars are suspended during a programmatic session-switch jump: the
+   *  switch re-renders the conversation column on the main thread, so the
+   *  jump must not pay per-frame 3D compositing on top of that render. */
+  #flipSuppressed = false
+  /** Last flip progress written (skip no-op style writes between frames). */
+  #lastFlipProgress: number | null = null
   #mounted = false
   #disposed = false
 
@@ -115,9 +142,56 @@ export class MobileController implements MobileControllerHandle {
   }
 
   /** Return to the chat page (a session picked in the sidebar). Pure scroll —
-   *  the sidebar state is untouched, so its content stays rendered. */
+   *  the sidebar state is untouched, so its content stays rendered. The jump
+   *  is INSTANT with flip vars suppressed: picking a session re-renders the
+   *  conversation column on the main thread, so a smooth scroll with
+   *  per-frame 3D updates would fight that render and jank on phones. */
   returnToChat(): void {
-    this.#placeOnChat('smooth')
+    this.#flipSuppressed = true
+    this.#placeOnChat('auto')
+    // Snap the flip vars straight to rest — no intermediate frames.
+    const frame = findFrame()
+    if (frame !== null) this.#setFlipVars(frame, 0)
+    this.#html?.removeAttribute('data-dshm-flipping')
+    this.#lastFlipProgress = 0
+  }
+
+  /** Measure the chat-page snap position and cache it (never cached from the
+   *  unsettled fallback — a 0-width pre-layout read must not poison the
+   *  cache). */
+  readonly #measureChatLeft = (frame: HTMLElement): number => {
+    const sidebar = frame.firstElementChild
+    if (sidebar instanceof HTMLElement && sidebar.offsetWidth > 0) {
+      this.#chatLeftCache = { frame, left: sidebar.offsetWidth }
+      return sidebar.offsetWidth
+    }
+    return frame.clientWidth
+  }
+
+  /** The chat-page snap position for the given frame: the cached value while
+   *  the frame (and the viewport) is unchanged, a live measurement
+   *  otherwise. Scroll handlers must take the cached path exclusively —
+   *  layout reads there are the mobile jank source. */
+  readonly #chatPageLeft = (frame: HTMLElement): number => {
+    const cache = this.#chatLeftCache
+    if (cache !== null && cache.frame === frame && cache.left > 0) return cache.left
+    return this.#measureChatLeft(frame)
+  }
+
+  /** Drop the cached snap position (viewport reflow / breakpoint crossing);
+   *  the next read re-measures from the live layout. */
+  readonly #invalidateChatLeft = (): void => {
+    this.#chatLeftCache = null
+  }
+
+  /** Write the four flip vars for a given pager progress (-1 … 0). */
+  readonly #setFlipVars = (frame: HTMLElement, progress: number): void => {
+    const abs = Math.abs(progress)
+    const right = Math.max(0, progress)
+    frame.style.setProperty('--dshm-rotate', `${progress * 10}deg`)
+    frame.style.setProperty('--dshm-scale', `${1 - abs * 0.06}`)
+    frame.style.setProperty('--dshm-offset-x', `${right * right * -48}px`)
+    frame.style.setProperty('--dshm-origin-x', `${50 - progress * 50}%`)
   }
 
   /** Install the controller. Safe to call once; a second call is a no-op.
@@ -188,12 +262,19 @@ export class MobileController implements MobileControllerHandle {
     for (const timer of [this.#keyboardFrame, this.#mountFrame, this.#resizeTimer, this.#settleTimer]) {
       if (timer !== null) (timer === this.#keyboardFrame || timer === this.#mountFrame ? cancelAnimationFrame : window.clearTimeout)(timer)
     }
+    for (const timer of this.#supplementTimers) window.clearTimeout(timer)
+    this.#supplementTimers.clear()
     this.#keyboardFrame = null
     this.#mountFrame = null
     this.#resizeTimer = null
     this.#settleTimer = null
+    this.#pointerDownPos = null
     const frame = findFrame()
-    if (frame !== null) frame.removeEventListener('scroll', this.#onPagerScroll)
+    if (frame !== null) {
+      frame.removeEventListener('scroll', this.#onPagerScroll)
+      frame.removeEventListener('pointerdown', this.#onPagerPointerDown)
+      frame.removeEventListener('pointerup', this.#onPagerPointerUp)
+    }
     if (this.#viewportMeta !== null) {
       if (this.#viewportOriginal !== null) this.#viewportMeta.content = this.#viewportOriginal
       else this.#viewportMeta.remove()
@@ -204,8 +285,12 @@ export class MobileController implements MobileControllerHandle {
     if (html !== null) {
       html.removeAttribute('data-dsh-mobile')
       html.removeAttribute(PAGE_ATTR)
+      html.removeAttribute('data-dshm-flipping')
       html.style.removeProperty('--dshm-keyboard-inset')
     }
+    this.#chatLeftCache = null
+    this.#flipSuppressed = false
+    this.#lastFlipProgress = null
     this.#html = null
   }
 
@@ -248,7 +333,7 @@ export class MobileController implements MobileControllerHandle {
     const frame = findFrame()
     const mobile = this.#mql?.matches ?? false
     if (frame === null || !mobile) return
-    const chatLeft = chatPageLeft(frame)
+    const chatLeft = this.#chatPageLeft(frame)
     if (chatLeft <= 0) return
     if (Math.abs(frame.scrollLeft - chatLeft) > 2) {
       frame.scrollTo({ left: chatLeft, behavior })
@@ -261,7 +346,7 @@ export class MobileController implements MobileControllerHandle {
   readonly #mirrorPage = (frame: HTMLElement, hint?: MobilePage): void => {
     const html = this.#html
     if (html === null) return
-    const chatLeft = chatPageLeft(frame)
+    const chatLeft = this.#chatPageLeft(frame)
     const page: MobilePage = chatLeft <= 0
       ? (hint ?? 'chat')
       : frame.scrollLeft < chatLeft / 2 ? 'sidebar' : 'chat'
@@ -284,8 +369,11 @@ export class MobileController implements MobileControllerHandle {
       attributeFilter: ['data-sidebar-collapsed'],
     })
     // Live pager driving (3D flip + settle re-snap) rides the frame's own
-    // scroll.
+    // scroll. Pointer tracking backs the one-tap session-switch guarantee
+    // (see #onPagerPointerUp).
     frame.addEventListener('scroll', this.#onPagerScroll, { passive: true })
+    frame.addEventListener('pointerdown', this.#onPagerPointerDown, { passive: true })
+    frame.addEventListener('pointerup', this.#onPagerPointerUp, { passive: true })
     // A frame that appears after mount (the layout entry loads later) still
     // gets the always-open treatment and starts on the chat page.
     this.#ensureSidebarOpen()
@@ -303,8 +391,12 @@ export class MobileController implements MobileControllerHandle {
         frame?.style.removeProperty(prop)
       }
       this.#html?.removeAttribute(PAGE_ATTR)
+      this.#html?.removeAttribute('data-dshm-flipping')
+      this.#flipSuppressed = false
+      this.#lastFlipProgress = null
       return
     }
+    this.#invalidateChatLeft()
     this.#ensureSidebarOpen()
     this.#placeOnChat('auto')
   }
@@ -317,7 +409,8 @@ export class MobileController implements MobileControllerHandle {
       const frame = findFrame()
       const mobile = this.#mql?.matches ?? false
       if (frame === null || !mobile) return
-      const chatLeft = chatPageLeft(frame)
+      this.#invalidateChatLeft()
+      const chatLeft = this.#chatPageLeft(frame)
       if (chatLeft <= 0) return
       const onChat = frame.scrollLeft >= chatLeft / 2
       frame.scrollTo({ left: onChat ? chatLeft : 0, behavior: 'auto' })
@@ -344,34 +437,95 @@ export class MobileController implements MobileControllerHandle {
     }, SCROLL_SETTLE_MS)
   }
 
+  /** Record the pointer-down position so #onPagerPointerUp can tell a tap
+   *  from a swipe. Deliberately does NOT touch the scroll position: a
+   *  programmatic scroll between pointerdown and pointerup is exactly what
+   *  makes browsers suppress the click, so the pager must stay untouched. */
+  readonly #onPagerPointerDown = (event: PointerEvent): void => {
+    this.#pointerDownPos = { x: event.clientX, y: event.clientY }
+  }
+
+  /** One-tap session-switch guarantee. The app's session rows switch on
+   *  their own onClick, but on touch the first tap is frequently swallowed
+   *  by the browser (click suppression after recent scrolling, or the
+   *  draggable row's drag-gesture disambiguation) — the row highlights, the
+   *  session does not, and the user has to tap again. When a TAP on a
+   *  session row has not switched the session shortly after, this opens it
+   *  directly through the sessions service, so one tap always switches. The
+   *  app's own click is never duplicated: if it already switched the
+   *  session, the check sees the new current and does nothing. */
+  readonly #onPagerPointerUp = (event: PointerEvent): void => {
+    const pos = this.#pointerDownPos
+    this.#pointerDownPos = null
+    if (pos === null) return
+    // A swipe (or drag-to-scroll) ending over a row must not open it.
+    if (Math.hypot(event.clientX - pos.x, event.clientY - pos.y) > TAP_SLOP) return
+    const mobile = this.#mql?.matches ?? false
+    if (!mobile) return
+    const target = event.target
+    if (!(target instanceof Element)) return
+    const row = target.closest('[role="treeitem"]')
+    if (row === null || !(row instanceof HTMLElement)) return
+    // Group rows toggle expansion; a row's own actions button opens the row
+    // menu — both keep their native behavior.
+    if (row.hasAttribute('aria-expanded')) return
+    if (!row.hasAttribute('aria-selected')) return
+    if (target.closest('button') !== null) return
+    const { openSession, resolveSessionId, currentSessionId } = this.#options
+    if (openSession === undefined || resolveSessionId === undefined || currentSessionId === undefined) return
+    const sessionId = resolveSessionId(row.textContent ?? '')
+    if (sessionId === undefined) return
+    if (currentSessionId() === sessionId) return
+    const timer = window.setTimeout(() => {
+      this.#supplementTimers.delete(timer)
+      if (this.#disposed) return
+      if (currentSessionId() === sessionId) return
+      openSession(sessionId)
+    }, TAP_SUPPLEMENT_MS)
+    this.#supplementTimers.add(timer)
+  }
+
   /** PiUI's flip: progress -1 (sidebar page) … 0 (chat page); the chat card
    *  rotates about the edge toward the swipe side and shrinks, so on the
-   *  sidebar page it sinks away leaving only a sliver visible. */
+   *  sidebar page it sinks away leaving only a sliver visible. Suppressed
+   *  during programmatic session-switch jumps (see #flipSuppressed); the
+   *  no-op guard also skips style writes when the progress has not actually
+   *  moved between frames. The [data-dshm-flipping] attribute grants the
+   *  card's 3D layer hint only while a flip is live — at rest the
+   *  conversation column is a plain 2D element. */
   readonly #updateFlipVars = (frame: HTMLElement): void => {
-    const chatLeft = chatPageLeft(frame)
+    if (this.#flipSuppressed) return
+    const chatLeft = this.#chatPageLeft(frame)
     if (chatLeft <= 0) return
     const progress = Math.max(-1, Math.min(1, (frame.scrollLeft - chatLeft) / chatLeft))
-    const abs = Math.abs(progress)
-    const right = Math.max(0, progress)
-    frame.style.setProperty('--dshm-rotate', `${progress * 10}deg`)
-    frame.style.setProperty('--dshm-scale', `${1 - abs * 0.06}`)
-    frame.style.setProperty('--dshm-offset-x', `${right * right * -48}px`)
-    frame.style.setProperty('--dshm-origin-x', `${50 - progress * 50}%`)
+    if (this.#lastFlipProgress !== null && Math.abs(progress - this.#lastFlipProgress) < 0.001) return
+    this.#lastFlipProgress = progress
+    this.#setFlipVars(frame, progress)
+    const html = this.#html
+    if (Math.abs(progress) > 0.001) html?.setAttribute('data-dshm-flipping', '')
+    else html?.removeAttribute('data-dshm-flipping')
   }
 
   readonly #settlePager = (): void => {
+    // A programmatic jump's suppression ends when the pager settles; a user
+    // swipe re-arms this timer via the scroll handler, which also ends it.
+    this.#flipSuppressed = false
     const frame = findFrame()
     const mobile = this.#mql?.matches ?? false
     if (frame === null || !mobile) return
-    const chatLeft = chatPageLeft(frame)
+    const chatLeft = this.#chatPageLeft(frame)
     if (chatLeft <= 0) return
     const left = frame.scrollLeft
     const nearest: MobilePage = left < chatLeft / 2 ? 'sidebar' : 'chat'
     const target = nearest === 'sidebar' ? 0 : chatLeft
     if (Math.abs(left - target) > 4) {
-      frame.scrollTo({ left: target, behavior: 'smooth' })
+      // INSTANT nudge: a smooth re-snap would animate after the gesture and
+      // eat the first tap that lands during it (browsers suppress clicks
+      // while the page scrolls).
+      frame.scrollTo({ left: target, behavior: 'auto' })
     }
     this.#mirrorPage(frame)
+    this.#updateFlipVars(frame)
   }
 
   /** A tap on the exposed chat card returns to the chat page (PiUI's
@@ -386,7 +540,7 @@ export class MobileController implements MobileControllerHandle {
     const frame = findFrame()
     const mobile = this.#mql?.matches ?? false
     if (frame === null || !mobile) return
-    const chatLeft = chatPageLeft(frame)
+    const chatLeft = this.#chatPageLeft(frame)
     if (chatLeft <= 0) return
     const sidebarCol = frame.firstElementChild
     // The sidebar's collapse toggle: stop the rail collapse, return to chat.

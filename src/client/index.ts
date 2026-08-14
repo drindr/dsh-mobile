@@ -34,6 +34,29 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => {
     const controller = new MobileController({
       toggleSidebar: () => ctx.layout.toggleSidebar(),
+      // One-tap session-switch guarantee: the row's own onClick switches on
+      // its click, but a tap the browser swallows must still switch — the
+      // controller opens the tapped session itself when the current session
+      // did not move. The session id is resolved by matching the row's text
+      // against the list snapshot's display titles (the rows carry no id
+      // attribute).
+      openSession: (sessionId) => {
+        ctx.sessions.open(sessionId as Parameters<typeof ctx.sessions.open>[0])
+      },
+      resolveSessionId: (rowText) => {
+        const state = ctx.sessions.list.getSnapshot()
+        let best: string | undefined
+        let bestLength = 0
+        for (const id of state.ids) {
+          const title = state.byId[id]?.displayTitle
+          if (title !== undefined && title.length > bestLength && rowText.includes(title)) {
+            best = id
+            bestLength = title.length
+          }
+        }
+        return best
+      },
+      currentSessionId: () => ctx.sessions.list.getSnapshot().current,
     })
     controller.mount()
     let lastCurrent = ctx.sessions.list.getSnapshot().current
