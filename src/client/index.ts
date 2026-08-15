@@ -16,7 +16,7 @@ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 // sessions service surface into this compilation unit.
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type {} from '@deepseek-ai/dsh-client-runtime/client'
-import { MobileController } from './controller.ts'
+import { MobileController, type PendingInteractionInfo } from './controller.ts'
 // Plugin-owned global mobile sheet (injected as a <style data-plugin> tag).
 import './mobile.css'
 
@@ -60,14 +60,70 @@ export function apply(ctx: ClientContext): void {
     })
     controller.mount()
     let lastCurrent = ctx.sessions.list.getSnapshot().current
+
+    /** Surface sessions (other than the current one) that wait on the user —
+     *  approval, question, or plan review — as a tappable banner. The app's
+     *  own indicator (a tiny dot on a row inside a workspace group) is
+     *  invisible on a phone. */
+    const syncPendingInteraction = (): void => {
+      const state = ctx.sessions.list.getSnapshot()
+      const current = state.current
+      let info: PendingInteractionInfo | null = null
+      let extraCount = 0
+      for (const id of state.ids) {
+        const summary = state.byId[id]
+        const kind = summary?.pendingInteraction
+        if (kind === undefined || summary === undefined) continue
+        if (id === current) continue // the current session shows the inline panel
+        if (info === null) {
+          info = { sessionId: id, title: summary.displayTitle, kind, extraCount: 0 }
+        } else {
+          extraCount += 1
+        }
+      }
+      if (info !== null && extraCount > 0) info.extraCount = extraCount
+      controller.setPendingInteraction(info)
+    }
+
     const off = ctx.sessions.list.subscribe(() => {
+      syncPendingInteraction()
       const next = ctx.sessions.list.getSnapshot().current
       if (next === lastCurrent) return
       lastCurrent = next
       controller.returnToChat()
     })
+    syncPendingInteraction()
+
+    /** Foreground recovery for lost pending waits. While the PWA is
+     *  backgrounded, iOS can suspend the SSE stream WITHOUT closing it — no
+     *  reconnect, so no mux-open replay. approval/question/plan-review frames
+     *  that arrived in that window are never replayed, yet the host-side list
+     *  still advertises the pending interaction (it is host-computed, not
+     *  frame-derived). So "the CURRENT session has a pending interaction but
+     *  no takeover panel is mounted" means the wait was lost: reload to force
+     *  a fresh connection whose mux-open replay re-mints the waits. A replay
+     *  that never lands (the ask was withdrawn server-side) clears the list
+     *  flag after reload, so this cannot loop. */
+    const recoverLostPending = (): void => {
+      if (document.visibilityState !== 'visible') return
+      // Give the app a beat to re-render pending panels after foregrounding.
+      window.setTimeout(() => {
+        const state = ctx.sessions.list.getSnapshot()
+        const current = state.current
+        if (current === undefined) return
+        const summary = state.byId[current]
+        if (summary?.pendingInteraction === undefined) return
+        const panel = document.querySelector(
+          '[data-approval-key], [data-question-key], [data-plan-review-key]',
+        )
+        if (panel !== null) return
+        location.reload()
+      }, 700)
+    }
+    document.addEventListener('visibilitychange', recoverLostPending)
     return () => {
       off()
+      document.removeEventListener('visibilitychange', recoverLostPending)
       controller.dispose()
     }
   }, 'dsh-mobile: DOM controller')

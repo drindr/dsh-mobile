@@ -20,7 +20,8 @@
     "src",
     "tests",
     "cordis.patch.yml",
-    "dsh.plugin.json"
+    "dsh.plugin.json",
+    "icon.png"
   ],
   "scripts": {
     "build": "tsdown",

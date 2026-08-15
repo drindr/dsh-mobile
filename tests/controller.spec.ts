@@ -78,7 +78,7 @@ describe('MobileController mount/dispose', () => {
     controller.mount()
     expect(document.documentElement.dataset.dshMobile).toBe('')
     const meta = document.querySelector('meta[name="viewport"]')
-    expect(meta?.getAttribute('content')).toContain('viewport-fit=cover')
+    expect(meta?.getAttribute('content')).not.toContain('viewport-fit')
     expect(meta?.getAttribute('content')).toContain('maximum-scale=1')
     controller.dispose()
     expect(document.documentElement.hasAttribute('data-dsh-mobile')).toBe(false)
@@ -261,11 +261,18 @@ describe('MobileController pager settle (re-snap without state sync)', () => {
 })
 
 describe('MobileController keyboard inset', () => {
-  it('writes the visual-viewport deficit as --dshm-keyboard-inset', () => {
+  it('writes the visual-viewport deficit as --dshm-keyboard-inset while an editable element is focused, and clears it otherwise', async () => {
     stubMatchMedia(false)
     makeFrame()
     const resizeHandlers: Array<() => void> = []
-    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => { cb(0); return 0 })
+    // A realistic rAF stub: schedules the callback async and returns a
+    // nonzero frame id (a synchronous stub returning 0 would leave the
+    // controller's in-flight guard stuck).
+    let rafId = 0
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      queueMicrotask(() => cb(0))
+      return ++rafId
+    })
     Object.defineProperty(window, 'visualViewport', {
       configurable: true,
       value: {
@@ -280,8 +287,21 @@ describe('MobileController keyboard inset', () => {
     controller.mount()
     Object.defineProperty(window, 'innerHeight', { configurable: true, value: 600 })
     Object.defineProperty(window.visualViewport, 'height', { configurable: true, value: 300 })
-    resizeHandlers[0]?.()
+    const fire = async () => { resizeHandlers[0]?.(); await Promise.resolve(); await Promise.resolve() }
+    // The keyboard inset only applies while typing: nothing focused → 0.
+    await fire()
+    expect(document.documentElement.style.getPropertyValue('--dshm-keyboard-inset')).toBe('0px')
+    // An editable element holds focus (the composer input) → the deficit applies.
+    const input = document.createElement('input')
+    document.body.append(input)
+    input.focus()
+    await fire()
     expect(document.documentElement.style.getPropertyValue('--dshm-keyboard-inset')).toBe('300px')
+    // Focus leaves the input (keyboard closed) → back to 0, even though the
+    // visualViewport still reports the shrunken height.
+    input.blur()
+    await fire()
+    expect(document.documentElement.style.getPropertyValue('--dshm-keyboard-inset')).toBe('0px')
     controller.dispose()
   })
 })

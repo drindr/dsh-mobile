@@ -39,6 +39,32 @@ const TAP_SUPPLEMENT_MS = 150
 /** Pointer movement (px) above which a pointerup is a swipe, not a tap. */
 const TAP_SLOP = 12
 
+/** The smallest height a real iOS keyboard can have. After the keyboard
+ *  closes, iOS can leave the visualViewport shrunken by just the accessory
+ *  bar (~44px) while the input keeps focus — an inset below this is that
+ *  residue, never a real keyboard, so it must be forced to 0. */
+const KEYBOARD_MIN_INSET = 60
+
+/** Conversation scroll depth (px) past which the top bar auto-collapses on
+ *  scroll-down. */
+const HEADER_COLLAPSE_THRESHOLD = 64
+
+/** The top bar re-expands on ANY upward scroll of at least this many pixels
+ *  (the standard mobile bar pattern: hide on scroll-down, reveal on
+ *  scroll-up). The slop keeps sub-threshold jitter from flipping the bar;
+ *  the collapse threshold plus the overflow guard are what prevent the
+ *  clamp-to-top twitch. */
+const HEADER_EXPAND_SLOP = 12
+
+/** After the header collapses/expands, layout-driven scrollTop noise (clamp,
+ *  anchor, re-anchor) is ignored for this long so it cannot flip the state
+ *  right back — the flicker loop. */
+const HEADER_QUIET_MS = 600
+
+/** Static home-screen icon shipped with the plugin and served by the harness
+ *  at /plugins/<id>/<file> — a REAL URL (Firefox ignores data-URI icons). */
+const PLUGIN_ICON_URL = '/plugins/@dsh-external/dsh-mobile/icon.png'
+
 /** The sidebar shell's collapse toggle labels (zh / en) — clicking it while
  *  the sidebar is expanded must NOT collapse it to the rail (which would
  *  unload its content); it flips back to the chat page instead. */
@@ -46,11 +72,14 @@ const SIDEBAR_COLLAPSE_LABELS = new Set(['收起侧边栏', 'Collapse sidebar'])
 
 /**
  * Viewport meta content: maximum-scale blocks the iOS focus zoom that would
- * otherwise fight the fixed-height mobile layout; viewport-fit=cover exposes
- * the safe-area insets to env().
+ * otherwise fight the fixed-height mobile layout. No viewport-fit=cover: in
+ * standalone PWA iOS keeps the status-bar strip blurred whenever web content
+ * extends underneath it, so we stay at the default viewport-fit=auto and let
+ * the app letterbox around the unsafe areas (env() insets read 0, the header
+ * and composer pad for the system chrome instead).
  */
 const VIEWPORT_CONTENT =
-  'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover'
+  'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no'
 
 /**
  * The AppFrame keeps at least one of its two data attributes in every state
@@ -88,12 +117,30 @@ export interface MobileControllerOptions {
   currentSessionId?: () => string | undefined
 }
 
+/** A session (other than the current one) waiting on the user: approval,
+ *  question, or plan review. Surfaces a tappable banner on phones — the
+ *  sidebar's 10px pending dot inside a collapsed workspace group is
+ *  effectively invisible on a phone screen. */
+export interface PendingInteractionInfo {
+  /** The waiting session's id. */
+  sessionId: string
+  /** Human-facing session title. */
+  title: string
+  /** Interaction kind (drives the banner copy). */
+  kind: 'approval' | 'plan-review' | 'question'
+  /** Further waiting sessions beyond the first. */
+  extraCount: number
+}
+
 /** Test-facing surface of the controller (the class keeps everything else private). */
 export interface MobileControllerHandle {
   /** True while the frame shows the sidebar expanded (not the rail). */
   isSidebarOpen(): boolean
   /** Return to the chat page (a session picked in the sidebar). */
   returnToChat(): void
+  /** Show/hide the pending-interaction banner (a non-current session waiting
+   *  for approval/answer). Pass null to hide. */
+  setPendingInteraction(info: PendingInteractionInfo | null): void
   /** Install the controller; idempotent. */
   mount(): void
   /** Remove every DOM effect; idempotent. */
@@ -109,7 +156,18 @@ export class MobileController implements MobileControllerHandle {
   #rootObserver: MutationObserver | null = null
   #viewportMeta: HTMLMetaElement | null = null
   #viewportOriginal: string | null = null
+  /** Injected iOS home-screen tags (removed on dispose). */
+  #pwaTags: Array<HTMLLinkElement | HTMLMetaElement> = []
   #keyboardFrame: number | null = null
+  /** While the keyboard inset is non-zero, a poll re-checks that the keyboard
+   *  is really still up — iOS can keep the input focused and the
+   *  visualViewport shrunken after the keyboard closes, stranding the
+   *  composer above the bottom without any event to reset it. */
+  #keyboardPollTimer: number | null = null
+  /** iOS focus/viewport compensations active (mobile only). */
+  #iosFocusPatched = false
+  /** Original .focus() implementations (restored on uninstall). */
+  #iosFocusOriginals: Array<{ proto: { prototype: { focus: Function } }; orig: Function }> = []
   #mountFrame: number | null = null
   #resizeTimer: number | null = null
   #settleTimer: number | null = null
@@ -117,6 +175,27 @@ export class MobileController implements MobileControllerHandle {
   #pointerDownPos: { x: number; y: number } | null = null
   /** Pending session-open supplement timers (cleared on dispose). */
   #supplementTimers = new Set<number>()
+  /** Watches for the approval panel (a tool waiting for permission) mounting
+   *  and keeps it in the visible viewport on phones. */
+  #approvalObserver: MutationObserver | null = null
+  /** The pending-interaction banner element (non-current session waiting). */
+  #pendingBanner: HTMLButtonElement | null = null
+  /** The composer input element (message box), or null before it mounts. */
+  #composerInput: HTMLInputElement | HTMLTextAreaElement | null = null
+  /** Composer input value at the last check (send detection). */
+  #composerLastValue = ''
+  /** Composer value-poll timer; runs only while the input is focused. */
+  #composerPollTimer: number | null = null
+  /** Picks up composer input mounts (the seat remounts on session switches). */
+  #composerObserver: MutationObserver | null = null
+  /** The conversation's scroll container (top-bar auto-collapse). */
+  #conversationScroll: HTMLElement | null = null
+  /** Settle timer for the top-bar evaluation (140 ms quiet window). */
+  #headerSettleTimer: number | null = null
+  /** scrollTop at the last settled evaluation (net-movement baseline). */
+  #lastSettledHeaderTop = 0
+  /** Layout-induced scroll noise is ignored until this time (see #settleHeader). */
+  #headerQuietUntil = 0
   #expandPending = false
   /** Cached chat-page snap position (measure once per stable layout, never
    *  inside a scroll handler — reading offsetWidth there forces layout). */
@@ -154,6 +233,45 @@ export class MobileController implements MobileControllerHandle {
     if (frame !== null) this.#setFlipVars(frame, 0)
     this.#html?.removeAttribute('data-dshm-flipping')
     this.#lastFlipProgress = 0
+  }
+
+  /** Show or hide the pending-interaction banner. The app's own pending
+   *  indicator is a 10px dot on a session row inside a workspace group —
+   *  invisible on a phone unless the user happens to expand the right group
+   *  and spot the dot. The banner makes a waiting session one tap away. */
+  setPendingInteraction(info: PendingInteractionInfo | null): void {
+    if (!(this.#mql?.matches ?? false) || info === null || this.#options.openSession === undefined) {
+      this.#removePendingBanner()
+      return
+    }
+    if (this.#pendingBanner === null) {
+      const banner = document.createElement('button')
+      banner.type = 'button'
+      banner.dataset.dshmPendingBanner = ''
+      banner.addEventListener('click', () => {
+        // The keyboard must not be open while jumping to a waiting session:
+        // a leftover input focus would cover the approval panel on phones.
+        const active = document.activeElement
+        if (active instanceof HTMLElement && active.matches('input, textarea, [contenteditable]')) {
+          active.blur()
+        }
+        this.#options.openSession?.(info.sessionId)
+      })
+      document.body.append(banner)
+      this.#pendingBanner = banner
+    }
+    const kindLabel: Record<PendingInteractionInfo['kind'], string> = {
+      approval: '等待审批',
+      'plan-review': '等待审阅',
+      question: '等待回答',
+    }
+    const extra = info.extraCount > 0 ? ` · 另有 ${info.extraCount} 个会话等待` : ''
+    this.#pendingBanner.textContent = `${kindLabel[info.kind]} · ${info.title}${extra} — 点击查看`
+  }
+
+  readonly #removePendingBanner = (): void => {
+    this.#pendingBanner?.remove()
+    this.#pendingBanner = null
   }
 
   /** Measure the chat-page snap position and cache it (never cached from the
@@ -194,6 +312,46 @@ export class MobileController implements MobileControllerHandle {
     frame.style.setProperty('--dshm-origin-x', `${50 - progress * 50}%`)
   }
 
+  /** Paint the document canvas with the app's actual background (theme
+   *  aware). `--dsw-alias-bg-base` is defined on <body>, so <html> cannot
+   *  inherit it via CSS — without this, the browser's white default canvas
+   *  shows as a white edge in the PWA's safe-area zones. */
+  readonly #syncCanvasBackground = (): void => {
+    const html = document.documentElement
+    const resolved = getComputedStyle(document.body).backgroundColor
+    if (resolved !== '' && resolved !== 'rgba(0, 0, 0, 0)' && resolved !== 'transparent') {
+      html.style.backgroundColor = resolved
+    }
+  }
+
+  /** Pin the shell height to the ACTUAL layout viewport. In Safari PWA
+   *  standalone mode the keyboard resizes the layout viewport, and the
+   *  `100dvh` unit can fail to re-evaluate after the keyboard closes — the
+   *  app stays ~an accessory bar (44px) short and the composer floats up.
+   *  Explicit pixels follow `window.innerHeight` wherever it actually is. */
+  readonly #pinLayoutHeight = (): void => {
+    const body = document.body
+    if (body !== null) body.style.height = `${window.innerHeight}px`
+  }
+
+  readonly #unpinLayoutHeight = (): void => {
+    document.body.style.removeProperty('height')
+  }
+
+  /** The overlay header no longer occupies layout space; the scroll body pads
+   *  its top by the header's natural height so the first content rests below
+   *  the floating bar. Measure it into --dshm-header-h. */
+  readonly #syncHeaderHeight = (): void => {
+    const html = this.#html
+    if (html === null) return
+    const header = document.querySelector<HTMLElement>(
+      '[data-phase="active"] header:not([data-composer-seat] *)',
+    )
+    if (header === null) return
+    const h = Math.round(header.getBoundingClientRect().height)
+    if (h > 0) html.style.setProperty('--dshm-header-h', `${h}px`)
+  }
+
   /** Install the controller. Safe to call once; a second call is a no-op.
    *  The frame may not exist yet (the layout entry mounts after this
    *  plugin's apply), so the observer chain re-finds it when #root gains
@@ -206,16 +364,25 @@ export class MobileController implements MobileControllerHandle {
     html.dataset.dshMobile = ''
 
     this.#installViewportMeta()
+    this.#syncCanvasBackground()
+    // iOS home-screen icon/manifest (async; harmless when it fails).
+    void this.#installPwaAssets()
 
     this.#mql = window.matchMedia(MOBILE_BREAKPOINT)
     this.#mql.addEventListener('change', this.#onBreakpointChange)
+    if (this.#mql.matches) this.#installIosFocusCompensations()
 
     // Keyboard inset: the visual viewport shrinks when the OS keyboard
     // opens; the composer seat pads itself by the difference (rAF-throttled
-    // — the resize fires every frame of the keyboard animation).
+    // — the resize fires every frame of the keyboard animation). When the
+    // focused composer unmounts (e.g. an approval panel replaces it), the
+    // keyboard closes WITHOUT a focus event on an input — re-check the inset
+    // so a stale value cannot strand the composer seat (and the approval
+    // panel inside it) high above the bottom of the phone screen.
     const vv = window.visualViewport
     vv?.addEventListener('resize', this.#requestKeyboard)
     vv?.addEventListener('scroll', this.#requestKeyboard)
+    document.addEventListener('focusout', this.#onFocusOut)
 
     // Keep the active page in place when the viewport width changes within
     // a breakpoint side (rotation / split-screen reflows the page tracks).
@@ -224,6 +391,15 @@ export class MobileController implements MobileControllerHandle {
     // A tap on the exposed chat card (while the pager rests on the sidebar
     // page) returns to the chat page — PiUI's overlay behavior.
     document.addEventListener('click', this.#onDocClickCapture, true)
+
+    // Keep the approval panel visible on phones: it replaces the composer
+    // while a tool waits for permission, and a stale keyboard inset or a
+    // mid-layout mount can strand it outside the viewport — the user then
+    // cannot approve and the command hangs. The observer is filtered to
+    // mutations that actually add/remove the panel, so the constant
+    // message-streaming mutations never run the panel check.
+    this.#approvalObserver = new MutationObserver(this.#onApprovalMutation)
+    this.#approvalObserver.observe(document.body, { childList: true, subtree: true })
 
     const root = document.getElementById('root')
     if (root !== null) {
@@ -241,6 +417,13 @@ export class MobileController implements MobileControllerHandle {
       this.#mountFrame = null
       this.#ensureSidebarOpen()
       this.#placeOnChat('auto')
+      // Normalize the window scroll (iOS can restore a stale offset on a
+      // resumed PWA), pin the shell height to the real viewport, and
+      // re-measure the composer's safe-area shortfall once the layout has
+      // settled.
+      this.#resetDocumentScroll()
+      this.#pinLayoutHeight()
+      window.setTimeout(() => { this.#syncComposerSafeShortfall() }, 400)
     })
   }
 
@@ -253,17 +436,27 @@ export class MobileController implements MobileControllerHandle {
     this.#frameObserver = null
     this.#rootObserver?.disconnect()
     this.#rootObserver = null
+    this.#approvalObserver?.disconnect()
+    this.#approvalObserver = null
+    this.#composerObserver?.disconnect()
+    this.#composerObserver = null
+    this.#detachComposerInput()
+    this.#detachConversationScroll()
+    this.#removeIosFocusCompensations()
     this.#mql?.removeEventListener('change', this.#onBreakpointChange)
     this.#mql = null
     window.removeEventListener('resize', this.#onWindowResize)
+    document.removeEventListener('focusout', this.#onFocusOut)
     window.visualViewport?.removeEventListener('resize', this.#requestKeyboard)
     window.visualViewport?.removeEventListener('scroll', this.#requestKeyboard)
     document.removeEventListener('click', this.#onDocClickCapture, true)
-    for (const timer of [this.#keyboardFrame, this.#mountFrame, this.#resizeTimer, this.#settleTimer]) {
+    for (const timer of [this.#keyboardFrame, this.#mountFrame, this.#resizeTimer, this.#settleTimer, this.#keyboardPollTimer]) {
       if (timer !== null) (timer === this.#keyboardFrame || timer === this.#mountFrame ? cancelAnimationFrame : window.clearTimeout)(timer)
     }
+    this.#keyboardPollTimer = null
     for (const timer of this.#supplementTimers) window.clearTimeout(timer)
     this.#supplementTimers.clear()
+    this.#removePendingBanner()
     this.#keyboardFrame = null
     this.#mountFrame = null
     this.#resizeTimer = null
@@ -281,13 +474,19 @@ export class MobileController implements MobileControllerHandle {
       this.#viewportMeta = null
       this.#viewportOriginal = null
     }
+    for (const tag of this.#pwaTags) tag.remove()
+    this.#pwaTags = []
     const html = this.#html
     if (html !== null) {
       html.removeAttribute('data-dsh-mobile')
       html.removeAttribute(PAGE_ATTR)
       html.removeAttribute('data-dshm-flipping')
+      html.removeAttribute('data-dshm-header-collapsed')
       html.style.removeProperty('--dshm-keyboard-inset')
+      html.style.removeProperty('--dshm-safe-shortfall')
+      html.style.removeProperty('background-color')
     }
+    this.#unpinLayoutHeight()
     this.#chatLeftCache = null
     this.#flipSuppressed = false
     this.#lastFlipProgress = null
@@ -307,6 +506,97 @@ export class MobileController implements MobileControllerHandle {
     meta.content = VIEWPORT_CONTENT
     document.head.append(meta)
     this.#viewportMeta = meta
+  }
+
+  /** iOS home-screen icon. In this deployment the server-rendered index
+   *  already carries the apple-touch-icon links (and the manifest ships the
+   *  PNG icon), so this early-returns. The injection below only matters on a
+   *  stock harness whose index was not patched: it re-adds the icon and the
+   *  iOS meta, preferring the plugin's statically served PNG (a real URL —
+   *  Firefox/iOS ignore data URIs) with a runtime-rasterized whale as the
+   *  standalone fallback. */
+  async #installPwaAssets(): Promise<void> {
+    const head = document.head
+    if (head === null || head.querySelector('link[rel="apple-touch-icon"]') !== null) return
+    let iconUrl: string | null = null
+    try {
+      const probe = await fetch(PLUGIN_ICON_URL, { method: 'HEAD' })
+      if (probe.ok) iconUrl = PLUGIN_ICON_URL
+    } catch { /* fall through to rasterization */ }
+    if (iconUrl === null) {
+      try {
+        const svg = (await (await fetch('/favicon.svg')).text())
+          // Drop the scheme-dependent <style> — the Path2D rasterizer fills
+          // the whale itself, so the path's own attributes don't matter.
+          .replace(/<style>[\s\S]*?<\/style>/g, '')
+        iconUrl = await this.#rasterizeSvg(svg, '#ffffff')
+      } catch {
+        iconUrl = this.#drawFallbackIcon('#ffffff')
+      }
+    }
+    if (iconUrl === null) return
+    const icon = document.createElement('link')
+    icon.rel = 'apple-touch-icon'
+    icon.href = iconUrl
+    head.append(icon)
+    this.#pwaTags.push(icon)
+    const metas: Array<[string, string]> = [
+      ['apple-mobile-web-app-capable', 'yes'],
+      ['apple-mobile-web-app-status-bar-style', 'black'],
+      ['apple-mobile-web-app-title', 'DeepSeek Harness'],
+    ]
+    for (const [name, content] of metas) {
+      if (head.querySelector(`meta[name="${name}"]`) !== null) continue
+      const meta = document.createElement('meta')
+      meta.name = name
+      meta.content = content
+      head.append(meta)
+      this.#pwaTags.push(meta)
+    }
+  }
+
+  /** Draw the DSH whale favicon path directly onto the canvas via Path2D.
+   *  Loading the SVG as an <img> is unreliable in some Blink/WebKit contexts
+   *  (it silently fails and the icon would fall back to a letter), while the
+   *  path data in the shipped favicon is stable. The favicon viewBox is
+   *  50×50; the whale is drawn padded inside the 180×180 canvas. */
+  async #rasterizeSvg(svg: string, background: string): Promise<string> {
+    const SIZE = 180
+    const pathMatch = /<path[^>]*\bd="([^"]*)"/.exec(svg)
+    if (pathMatch === null) throw new Error('no path in favicon')
+    const canvas = document.createElement('canvas')
+    canvas.width = SIZE
+    canvas.height = SIZE
+    const ctx = canvas.getContext('2d')
+    if (ctx === null) throw new Error('canvas 2d unavailable')
+    ctx.fillStyle = background
+    ctx.fillRect(0, 0, SIZE, SIZE)
+    const whale = new Path2D(pathMatch[1])
+    const pad = Math.round(SIZE * 0.18)
+    ctx.translate(pad, pad)
+    ctx.scale((SIZE - pad * 2) / 50, (SIZE - pad * 2) / 50)
+    ctx.fillStyle = '#000000'
+    ctx.fill(whale)
+    return canvas.toDataURL('image/png')
+  }
+
+  /** Brand-color square with a white "D" — used when the favicon fetch or
+   *  rasterization fails. */
+  #drawFallbackIcon(background: string): string {
+    const SIZE = 180
+    const canvas = document.createElement('canvas')
+    canvas.width = SIZE
+    canvas.height = SIZE
+    const ctx = canvas.getContext('2d')
+    if (ctx === null) return ''
+    ctx.fillStyle = background
+    ctx.fillRect(0, 0, SIZE, SIZE)
+    ctx.fillStyle = '#000000'
+    ctx.font = 'bold 120px system-ui, -apple-system, sans-serif'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillText('D', SIZE / 2, SIZE / 2 + 6)
+    return canvas.toDataURL('image/png')
   }
 
   /** The always-open phone layout expands the docked sidebar once when the
@@ -374,6 +664,18 @@ export class MobileController implements MobileControllerHandle {
     frame.addEventListener('scroll', this.#onPagerScroll, { passive: true })
     frame.addEventListener('pointerdown', this.#onPagerPointerDown, { passive: true })
     frame.addEventListener('pointerup', this.#onPagerPointerUp, { passive: true })
+    // Composer input + conversation-scroll tracking: the seats remount on
+    // session switches, so re-find them whenever the frame's subtree changes
+    // (dismiss-keyboard-on-send; top-bar auto-collapse).
+    this.#composerObserver = new MutationObserver(() => {
+      this.#attachComposerInput(frame)
+      this.#attachConversationScroll(frame)
+      this.#syncHeaderHeight()
+    })
+    this.#composerObserver.observe(frame, { childList: true, subtree: true })
+    this.#attachComposerInput(frame)
+    this.#attachConversationScroll(frame)
+    this.#syncHeaderHeight()
     // A frame that appears after mount (the layout entry loads later) still
     // gets the always-open treatment and starts on the chat page.
     this.#ensureSidebarOpen()
@@ -387,6 +689,7 @@ export class MobileController implements MobileControllerHandle {
     const mobile = this.#mql?.matches ?? false
     const frame = findFrame()
     if (!mobile) {
+      this.#removeIosFocusCompensations()
       for (const prop of ['--dshm-rotate', '--dshm-scale', '--dshm-offset-x', '--dshm-origin-x']) {
         frame?.style.removeProperty(prop)
       }
@@ -396,7 +699,10 @@ export class MobileController implements MobileControllerHandle {
       this.#lastFlipProgress = null
       return
     }
+    this.#installIosFocusCompensations()
+    this.#syncCanvasBackground()
     this.#invalidateChatLeft()
+    this.#syncComposerSafeShortfall()
     this.#ensureSidebarOpen()
     this.#placeOnChat('auto')
   }
@@ -409,7 +715,11 @@ export class MobileController implements MobileControllerHandle {
       const frame = findFrame()
       const mobile = this.#mql?.matches ?? false
       if (frame === null || !mobile) return
+      // Follow the layout viewport wherever iOS actually put it (the PWA
+      // keyboard resizes it; the dvh unit can lag).
+      this.#pinLayoutHeight()
       this.#invalidateChatLeft()
+      this.#syncComposerSafeShortfall()
       const chatLeft = this.#chatPageLeft(frame)
       if (chatLeft <= 0) return
       const onChat = frame.scrollLeft >= chatLeft / 2
@@ -443,6 +753,185 @@ export class MobileController implements MobileControllerHandle {
    *  makes browsers suppress the click, so the pager must stay untouched. */
   readonly #onPagerPointerDown = (event: PointerEvent): void => {
     this.#pointerDownPos = { x: event.clientX, y: event.clientY }
+  }
+
+  /** Bind the composer input listeners. The input (re)mounts when the
+   *  composer seat renders for a session, so this re-finds it whenever the
+   *  frame's subtree changes. */
+  readonly #attachComposerInput = (frame: HTMLElement): void => {
+    const input = frame.querySelector<HTMLInputElement | HTMLTextAreaElement>(
+      '[data-composer-seat] input, [data-composer-seat] textarea',
+    )
+    if (input === this.#composerInput) return
+    this.#detachComposerInput()
+    this.#composerInput = input
+    if (input === null) return
+    this.#composerLastValue = input.value
+    input.addEventListener('focus', this.#onComposerFocus)
+    input.addEventListener('blur', this.#onComposerBlur)
+    input.addEventListener('keydown', this.#onComposerKeydown)
+    if (document.activeElement === input) this.#onComposerFocus()
+    this.#syncComposerSafeShortfall()
+  }
+
+  /** The app's composer card already reserves bottom space; compute how much
+   *  MORE is needed so the card clears the home indicator with a little
+   *  breathing room — instead of app gap + a full safe-bottom (an empty strip
+   *  in standalone PWA mode). Keyboard open leaves the measurement alone (the
+   *  composer is lifted anyway). */
+  readonly #syncComposerSafeShortfall = (): void => {
+    const html = this.#html
+    if (html === null) return
+    const card = document.querySelector<HTMLElement>('[data-composer-card]')
+    if (card === null) return
+    const appGap = Math.max(0, window.innerHeight - card.getBoundingClientRect().bottom)
+    const safeBottom = parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue('--dshm-safe-bottom'),
+    ) || 0
+    const shortfall = Math.max(0, Math.round(safeBottom + 8 - appGap))
+    html.style.setProperty('--dshm-safe-shortfall', `${shortfall}px`)
+  }
+
+  readonly #detachComposerInput = (): void => {
+    if (this.#composerInput !== null) {
+      this.#composerInput.removeEventListener('focus', this.#onComposerFocus)
+      this.#composerInput.removeEventListener('blur', this.#onComposerBlur)
+      this.#composerInput.removeEventListener('keydown', this.#onComposerKeydown)
+      this.#composerInput = null
+    }
+    this.#stopComposerPoll()
+  }
+
+  /** Dismiss the keyboard once a message is sent. The composer input is
+   *  cleared by the app on send (Enter, the send button, or a slash-command
+   *  submit); a non-empty → empty transition while focused means a send, so
+   *  blur the input and reset the keyboard inset. A 250 ms poll while the
+   *  input is focused is cheap and catches every send path. */
+  readonly #onComposerFocus = (): void => {
+    this.#composerLastValue = this.#composerInput?.value ?? ''
+    if (this.#composerPollTimer !== null) return
+    this.#composerPollTimer = window.setInterval(() => {
+      const input = this.#composerInput
+      if (input === null || document.activeElement !== input) return
+      const value = input.value
+      if (this.#composerLastValue !== '' && value === '') {
+        this.#dismissComposerKeyboard()
+        return
+      }
+      this.#composerLastValue = value
+    }, 250)
+  }
+
+  readonly #onComposerBlur = (): void => {
+    this.#stopComposerPoll()
+  }
+
+  /** Enter (without Shift, and not while IME-composing) sends the message:
+   *  blur once the app has processed the submit. */
+  readonly #onComposerKeydown = (event: Event): void => {
+    const keyEvent = event as KeyboardEvent
+    if (keyEvent.key !== 'Enter' || keyEvent.shiftKey || keyEvent.isComposing) return
+    window.setTimeout(() => { this.#dismissComposerKeyboard() }, 120)
+  }
+
+  /** Blur the composer input (dismiss the keyboard) and clear the inset —
+   *  mobile only; desktop focus behavior stays untouched. */
+  readonly #dismissComposerKeyboard = (): void => {
+    this.#stopComposerPoll()
+    if (!(this.#mql?.matches ?? false)) return
+    const input = this.#composerInput
+    if (input !== null && document.activeElement === input) input.blur()
+    this.#html?.style.setProperty('--dshm-keyboard-inset', '0px')
+  }
+
+  readonly #stopComposerPoll = (): void => {
+    if (this.#composerPollTimer !== null) {
+      window.clearInterval(this.#composerPollTimer)
+      this.#composerPollTimer = null
+    }
+  }
+
+  /** Bind the conversation scroll container. It remounts on session switches,
+   *  so this re-finds it whenever the frame's subtree changes. */
+  readonly #attachConversationScroll = (frame: HTMLElement): void => {
+    const scroll = frame.querySelector<HTMLElement>('[data-conversation-scroll]')
+    if (scroll === this.#conversationScroll) return
+    this.#detachConversationScroll()
+    this.#conversationScroll = scroll
+    if (scroll === null) return
+    this.#lastSettledHeaderTop = scroll.scrollTop
+    scroll.addEventListener('scroll', this.#onConversationScroll, { passive: true })
+    // Start consistent (a previous session may have left the bar collapsed).
+    this.#syncHeaderCollapse()
+  }
+
+  readonly #detachConversationScroll = (): void => {
+    this.#conversationScroll?.removeEventListener('scroll', this.#onConversationScroll)
+    this.#conversationScroll = null
+    if (this.#headerSettleTimer !== null) {
+      window.clearTimeout(this.#headerSettleTimer)
+      this.#headerSettleTimer = null
+    }
+  }
+
+  /** Auto-collapse the top bar (session title + Chat/Trajectory tabs) while
+   *  the user scrolls DOWN through the conversation, and reveal it on the
+   *  way back up — the phone gains the header's height for reading. A
+   *  same-position event (content reflow while scrolled) must NOT flip the
+   *  state: only a strictly decreasing scrollTop expands the bar again. */
+  readonly #onConversationScroll = (): void => {
+    // Evaluate the top bar only AFTER the scroll settles — per-event flips
+    // are what made it twitch (momentum jitter, layout shifts from the
+    // collapse itself). A 140 ms quiet window later, the net movement since
+    // the last settled position decides collapse vs reveal.
+    if (this.#headerSettleTimer !== null) window.clearTimeout(this.#headerSettleTimer)
+    this.#headerSettleTimer = window.setTimeout(() => {
+      this.#headerSettleTimer = null
+      this.#settleHeader()
+    }, 140)
+  }
+
+  readonly #settleHeader = (): void => {
+    const scroll = this.#conversationScroll
+    const html = this.#html
+    if (scroll === null || html === null) return
+    const top = scroll.scrollTop
+    const last = this.#lastSettledHeaderTop
+    this.#lastSettledHeaderTop = top
+    // Quiet window after a state change: collapsing/expanding the header
+    // changes the scroll container's height, the browser clamps/anchors
+    // scrollTop, and a re-anchor moves it — evaluating during that window
+    // reads those layout-induced moves as user scrolls and flips the state
+    // right back (the flicker loop). Track the baseline through the quiet
+    // period and only evaluate against the settled position.
+    if (performance.now() < this.#headerQuietUntil) return
+    if (!(this.#mql?.matches ?? false)) {
+      html.removeAttribute('data-dshm-header-collapsed')
+      return
+    }
+    // The header floats in its own overlay layer (position: absolute), so
+    // collapsing/expanding it never changes the scroll container's height —
+    // the visible content stays put by construction.
+    const wasCollapsed = html.hasAttribute('data-dshm-header-collapsed')
+    let changed = false
+    if (wasCollapsed) {
+      // Reveal on any net upward scroll (slop-guarded); the collapse
+      // threshold + overflow guard below keep it from twitching at the fold.
+      if (top < last - HEADER_EXPAND_SLOP) {
+        html.removeAttribute('data-dshm-header-collapsed')
+        changed = true
+      }
+    } else if (top > last + HEADER_EXPAND_SLOP && top > HEADER_COLLAPSE_THRESHOLD
+      // The content must actually overflow: collapsing a just-fitting
+      // conversation clamps scrollTop to 0, which would immediately
+      // re-expand and twitch.
+      && scroll.scrollHeight > scroll.clientHeight + HEADER_COLLAPSE_THRESHOLD) {
+      html.setAttribute('data-dshm-header-collapsed', '')
+      changed = true
+    }
+    if (changed) {
+      this.#headerQuietUntil = performance.now() + HEADER_QUIET_MS
+    }
   }
 
   /** One-tap session-switch guarantee. The app's session rows switch on
@@ -569,13 +1058,245 @@ export class MobileController implements MobileControllerHandle {
     })
   }
 
+  /** Focus left an input (the composer was replaced by the approval panel,
+   *  or the user dismissed the keyboard): the OS keyboard is closing, so the
+   *  seat must drop back to the bottom. Re-check immediately and once more
+   *  after the keyboard animation settles. */
+  readonly #onFocusOut = (): void => {
+    if (document.activeElement?.matches('input, textarea, [contenteditable]')) return
+    this.#updateKeyboardInset()
+    window.setTimeout(() => {
+      if (this.#disposed) return
+      this.#updateKeyboardInset()
+    }, 160)
+  }
+
   readonly #updateKeyboardInset = (): void => {
     const html = this.#html
     if (html === null) return
+    // The keyboard only stays up while an editable element holds focus — if
+    // nothing editable is focused the inset MUST be 0, no matter what the
+    // visualViewport reports (iOS standalone mode can leave the viewport
+    // shrunken after the keyboard closes, which otherwise strands the
+    // composer high above the bottom).
+    const active = document.activeElement
+    const editableFocused = active instanceof HTMLElement
+      && active.matches('input, textarea, [contenteditable]')
     const vv = window.visualViewport
-    const inset = vv !== null && vv.height < window.innerHeight
+    let inset = editableFocused && vv !== null && vv.height < window.innerHeight
       ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
       : 0
+    // Clamp pathological values (a stale half-open keyboard or a broken
+    // visualViewport must never strand the composer above the fold).
+    inset = Math.min(inset, window.innerHeight * 0.5)
+    // An inset below the smallest real keyboard is iOS's accessory-bar
+    // residue after the keyboard closed (visualViewport stuck ~44px short
+    // while the input keeps focus) — not a keyboard, force it to 0 or the
+    // composer floats by exactly that residue.
+    if (inset > 0 && inset < KEYBOARD_MIN_INSET) inset = 0
+    const previousInset = parseFloat(html.style.getPropertyValue('--dshm-keyboard-inset')) || 0
     html.style.setProperty('--dshm-keyboard-inset', `${inset}px`)
+    if (inset > 0) this.#ensureKeyboardPoll()
+    else this.#stopKeyboardPoll()
+    // The keyboard just closed (inset → 0): blur the focused input to release
+    // iOS's "keep the focused element visible" hold (which re-pans the page
+    // after any scroll reset), then reset every scroll surface. The layout
+    // viewport can take a beat to restore in the PWA — re-pin the shell
+    // height after it settles.
+    if (previousInset > 0 && inset === 0) {
+      this.#blurActiveForm()
+      this.#resetDocumentScroll()
+      window.setTimeout(() => { this.#pinLayoutHeight() }, 400)
+    }
+    // iOS scrolls the window to reveal the focused input on keyboard
+    // open/close; the shell is fixed-height, so undo it (the composer is
+    // lifted by the inset above — no window scroll is needed or wanted).
+    this.#resetDocumentScroll()
+    // The keyboard opening scrolls the focused input into view (large
+    // scrollTop → the top bar collapses); when it closes, the viewport
+    // returns and scrollTop drops without a guaranteed scroll event — re-sync
+    // the collapse so the bar cannot stay hidden.
+    this.#syncHeaderCollapse()
+  }
+
+  /** Re-check the keyboard state every 300 ms while the inset is non-zero:
+   *  the moment no editable element is focused or the visual viewport is
+   *  back to full height, the keyboard is gone — zero the inset even when
+   *  iOS never fired a resize (its stale-viewport quirk). */
+  readonly #ensureKeyboardPoll = (): void => {
+    if (this.#keyboardPollTimer !== null) return
+    this.#keyboardPollTimer = window.setInterval(() => {
+      const active = document.activeElement
+      const editableFocused = active instanceof HTMLElement
+        && active.matches('input, textarea, [contenteditable]')
+      const vv = window.visualViewport
+      const inset = vv !== null ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0
+      // Treat an accessory-bar residue (inset below a real keyboard's size)
+      // as "keyboard gone" too — the visualViewport can stay ~44px short
+      // after the keyboard closes while the input keeps focus.
+      if (!editableFocused || vv === null || vv.height >= window.innerHeight - 2 || inset < KEYBOARD_MIN_INSET) {
+        this.#stopKeyboardPoll()
+        this.#html?.style.setProperty('--dshm-keyboard-inset', '0px')
+        this.#resetDocumentScroll()
+        this.#syncHeaderCollapse()
+      }
+    }, 300)
+  }
+
+  readonly #stopKeyboardPoll = (): void => {
+    if (this.#keyboardPollTimer !== null) {
+      window.clearInterval(this.#keyboardPollTimer)
+      this.#keyboardPollTimer = null
+    }
+  }
+
+  /** Reset every document scroll surface. iOS pans the visual viewport when
+   *  the keyboard opens/closes and re-scrolls even with `overflow: hidden` —
+   *  a single `window.scrollTo(0,0)` is not enough: the pan can also live on
+   *  the documentElement/body scrollTop (the ~one-accessory-bar shift). */
+  readonly #resetDocumentScroll = (): void => {
+    if (window.scrollY !== 0 || window.scrollX !== 0) window.scrollTo(0, 0)
+    if (document.documentElement.scrollTop !== 0) document.documentElement.scrollTop = 0
+    if (document.body.scrollTop !== 0) document.body.scrollTop = 0
+  }
+
+  /** iOS PWA viewport compensations (adapted from the well-known
+   *  ios-pwa-scrolling-input-focus-fix pattern). iOS auto-scrolls / pans the
+   *  document to keep a focused input visible, breaking the fixed-height
+   *  shell — and `scrollTo(0,0)` alone does not stick because iOS re-scrolls
+   *  while the input is focused. Mobile only: desktop focus behavior stays
+   *  untouched. */
+  readonly #installIosFocusCompensations = (): void => {
+    if (this.#iosFocusPatched) return
+    this.#iosFocusPatched = true
+    // (2) touchstart capture → pre-focus with preventScroll: the later
+    // native focus event sees the element already focused and iOS skips its
+    // auto-scroll/pan.
+    document.addEventListener('touchstart', this.#onTouchStartFocus, { capture: true, passive: true })
+    // (3) prototype patch: every .focus() on form controls uses
+    // preventScroll + an explicit centered scrollIntoView, covering all
+    // programmatic focus paths.
+    const protos = [HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement]
+    for (const proto of protos) {
+      const original = proto.prototype.focus
+      this.#iosFocusOriginals.push({ proto, orig: original })
+      proto.prototype.focus = function (this: HTMLElement, options?: FocusOptions) {
+        const result = original.call(this, { ...options, preventScroll: true })
+        requestAnimationFrame(() => { this.scrollIntoView?.({ block: 'center' }) })
+        return result
+      }
+    }
+    // (4) background/restore: blur the focused control on hide AND show so
+    // iOS releases its "maintain focus visibility" loop and the scroll
+    // reset sticks.
+    document.addEventListener('visibilitychange', this.#onVisibilityChange)
+    window.addEventListener('pagehide', this.#blurActiveForm)
+    window.addEventListener('pageshow', this.#onShowReset)
+  }
+
+  readonly #removeIosFocusCompensations = (): void => {
+    if (!this.#iosFocusPatched) return
+    this.#iosFocusPatched = false
+    document.removeEventListener('touchstart', this.#onTouchStartFocus, { capture: true })
+    for (const { proto, orig } of this.#iosFocusOriginals) proto.prototype.focus = orig
+    this.#iosFocusOriginals = []
+    document.removeEventListener('visibilitychange', this.#onVisibilityChange)
+    window.removeEventListener('pagehide', this.#blurActiveForm)
+    window.removeEventListener('pageshow', this.#onShowReset)
+  }
+
+  readonly #onTouchStartFocus = (event: TouchEvent): void => {
+    const target = event.target
+    if (target instanceof Element && target.matches('input, textarea, select')
+      && document.activeElement !== target) {
+      ;(target as HTMLInputElement).focus({ preventScroll: true })
+    }
+  }
+
+  readonly #blurActiveForm = (): void => {
+    const active = document.activeElement
+    if (active instanceof HTMLElement && active.matches('input, textarea, select')) active.blur()
+  }
+
+  readonly #onVisibilityChange = (): void => {
+    if (document.visibilityState === 'hidden') this.#blurActiveForm()
+    else if (document.visibilityState === 'visible') this.#onShowReset()
+  }
+
+  readonly #onShowReset = (): void => {
+    this.#blurActiveForm()
+    this.#resetDocumentScroll()
+    this.#updateKeyboardInset()
+  }
+
+  /** Force the top-bar collapse state consistent with the current scroll
+   *  position: expanded when the content no longer overflows or the user is
+   *  back near the top (the keyboard-close recovery path). */
+  readonly #syncHeaderCollapse = (): void => {
+    const html = this.#html
+    const scroll = this.#conversationScroll
+    if (html === null || scroll === null) return
+    if (!(this.#mql?.matches ?? false)) {
+      html.removeAttribute('data-dshm-header-collapsed')
+      return
+    }
+    const top = scroll.scrollTop
+    if (top <= 32
+      || scroll.scrollHeight <= scroll.clientHeight + HEADER_COLLAPSE_THRESHOLD) {
+      html.removeAttribute('data-dshm-header-collapsed')
+    }
+  }
+
+  /** Keep the approval panel (a tool waiting for permission, rendered in the
+   *  composer seat) inside the visible viewport on phones. The seat is
+   *  sticky, but a stale keyboard inset or a mount racing the layout can
+   *  leave the panel above or below the fold — invisible and unanswerable,
+   *  which strands the pending command. Also releases any leftover input
+   *  focus: switching to a waiting session while the composer keyboard is
+   *  open would leave the panel covered by the keyboard. */
+  /** Only the approval panel's own mount/unmount matters to
+   *  #ensureApprovalVisible — filtering here keeps the constant message
+   *  streaming mutations from paying for the panel query. */
+  readonly #onApprovalMutation = (mutations: MutationRecord[]): void => {
+    for (const mutation of mutations) {
+      const nodes = mutation.addedNodes
+      for (let i = 0; i < nodes.length; i++) {
+        const node = nodes[i]
+        if (node === undefined || node.nodeType !== 1) continue
+        const el = node as Element
+        if (el.matches?.('[data-approval-key]') === true || el.querySelector?.('[data-approval-key]') !== null) {
+          this.#ensureApprovalVisible()
+          return
+        }
+      }
+      const removed = mutation.removedNodes
+      for (let i = 0; i < removed.length; i++) {
+        const node = removed[i]
+        if (node === undefined || node.nodeType !== 1) continue
+        const el = node as Element
+        if (el.matches?.('[data-approval-key]') === true || el.querySelector?.('[data-approval-key]') !== null) {
+          this.#ensureApprovalVisible()
+          return
+        }
+      }
+    }
+  }
+
+  readonly #ensureApprovalVisible = (): void => {
+    if (!(this.#mql?.matches ?? false)) return
+    const panel = document.querySelector<HTMLElement>('[data-approval-key]')
+    if (panel === null || panel.clientHeight <= 0) return
+    // An approval panel replaces the composer: no input may hold focus, and
+    // the keyboard must read as closed (blur idempotent when already clear).
+    const active = document.activeElement
+    if (active instanceof HTMLElement && active.matches('input, textarea, [contenteditable]')) {
+      active.blur()
+    }
+    this.#html?.style.setProperty('--dshm-keyboard-inset', '0px')
+    const r = panel.getBoundingClientRect()
+    const vh = window.innerHeight
+    const fullyVisible = r.top >= 0 && r.bottom <= vh
+    if (fullyVisible) return
+    panel.scrollIntoView({ block: 'nearest', behavior: 'auto' })
   }
 }

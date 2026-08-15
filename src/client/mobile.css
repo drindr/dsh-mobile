@@ -44,6 +44,19 @@
 }
 
 /* ---------- shell ergonomics ---------- */
+[data-dsh-mobile] html,
+[data-dsh-mobile] body {
+  /* The app is a fixed-height shell: the window must never scroll. iOS
+     Safari scrolls the window when the keyboard opens/closes (to reveal the
+     focused input), which shifts the whole page — 偏下 before the first
+     keyboard, 偏上 after it retracts. Locking the document kills that. */
+  overflow: hidden;
+  /* The browser's default canvas is WHITE; in the PWA the safe-area zones
+     (status bar / home indicator) can fall outside the app's painted area,
+     exposing a white edge. Paint the canvas with the app's background. */
+  background: var(--dsw-alias-bg-base, #151517);
+}
+
 [data-dsh-mobile] body {
   overscroll-behavior-y: none;
   -webkit-text-size-adjust: 100%;
@@ -123,7 +136,11 @@
      The conversation renders completely untouched inside. The transform is
      identity when the pager rests on the chat page (progress 0), so the
      override below drops it to `none` there — a giant pinned 3D layer of
-     the whole conversation column is the mobile jank source. */
+     the whole conversation column is the mobile jank source. NO 3D
+     transform context at rest (transform-style/backface-visibility live
+     under [data-dshm-flipping] only): iOS Safari mis-renders elements that
+     MOUNT inside a preserve-3d context — the approval/question takeover
+     panels flashed once and never painted again. */
   [data-dsh-mobile] div[data-sidebar-collapsed] > :nth-child(2),
   [data-dsh-mobile] div[data-details-collapsed] > :nth-child(2) {
     border: none;
@@ -135,8 +152,6 @@
       rotateY(var(--dshm-rotate, 0deg))
       scale(var(--dshm-scale, 1));
     transform-origin: var(--dshm-origin-x, 50% 50%);
-    transform-style: preserve-3d;
-    backface-visibility: hidden;
   }
 
   /* Pager at rest on the chat page (no flip live): the identity transform
@@ -146,12 +161,18 @@
   [data-dsh-mobile]:not([data-dshm-flipping]) div[data-sidebar-collapsed] > :nth-child(2),
   [data-dsh-mobile]:not([data-dshm-flipping]) div[data-details-collapsed] > :nth-child(2) {
     transform: none;
+    transform-style: flat;
+    backface-visibility: visible;
   }
 
-  /* The 3D layer hint is granted only while a flip is actually live: at
-     rest the card must not pin a will-change layer on phones. */
+  /* The 3D layer (preserve-3d + hidden backface + will-change) is granted
+     only while a flip is actually live: at rest the card must not pin a 3D
+     transform context or a will-change layer on phones — both are the iOS
+     mis-render source for panels that mount inside the card. */
   [data-dsh-mobile][data-dshm-flipping] div[data-sidebar-collapsed] > :nth-child(2),
   [data-dsh-mobile][data-dshm-flipping] div[data-details-collapsed] > :nth-child(2) {
+    transform-style: preserve-3d;
+    backface-visibility: hidden;
     will-change: transform;
   }
 
@@ -170,9 +191,51 @@
     display: none !important;
   }
 
-  /* Session header: compact with a safe-area top. */
-  [data-dsh-mobile] [data-phase='active'] > header {
+  /* Session header: compact with a safe-area top, floating in its OWN layer
+     (overlay, not in the layout flow). Because the header never occupies
+     layout space, the scroll container's height is constant — expanding the
+     bar cannot push the conversation down and collapsing it cannot yank it.
+     The collapse is a pure transform slide (GPU, no layout, no reflow). The
+     root anchors the absolutely-positioned header. */
+  [data-dsh-mobile] [data-phase='active'] {
+    position: relative;
+  }
+
+  [data-dsh-mobile] [data-phase='active'] header:not([data-composer-seat] *) {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 20;
+    /* Solid, opaque: content scrolls UNDER the floating bar and must not
+       show through. A hairline bottom border separates it from the content. */
+    background: var(--dsw-alias-bg-base, #151517);
+    box-shadow: inset 0 -1px 0 var(--dsw-alias-border-l1, rgba(128, 128, 128, 0.2));
     padding: calc(6px + var(--dshm-safe-top)) 8px 0 8px;
+    /* Pure slide: the chat card clips the translated bar, so no opacity
+       fade is needed — a clean, smooth retraction. */
+    transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  /* Top bar (session title + Chat/Trajectory tabs): the controller sets
+     [data-dshm-header-collapsed] on <html> while the user scrolls down
+     through the conversation; the bar slides away over the content (the
+     scroll body underneath is already full-height) and slides back on
+     scroll-up. No layout change → the visible content never moves. The
+     :not([data-composer-seat] *) guard keeps the takeover panels' own
+     <header> (approval/question title bars, which live inside the composer
+     seat) out of the top-bar treatment — without it the panel title gets
+     the bar's absolute positioning and slide animation ("polluted" look). */
+  [data-dsh-mobile][data-dshm-header-collapsed] [data-phase='active'] header:not([data-composer-seat] *) {
+    transform: translateY(-100%);
+    pointer-events: none;
+  }
+
+  /* The first content must start below the floating header when at rest;
+     the controller measures the header's natural height into
+     --dshm-header-h. */
+  [data-dsh-mobile] [data-phase='active'] [data-conversation-scroll] {
+    padding-top: var(--dshm-header-h, 76px);
   }
 
   /* Conversation column: snugger side clearance for the composer card. */
@@ -181,20 +244,29 @@
   }
 
   /* Sticky composer seat: lift the input card above the home indicator and
-     the virtual keyboard (both insets are 0 outside mobile contexts). */
+     the virtual keyboard. The app's composer already reserves its own bottom
+     gap, so the controller only adds the SHORTFALL to the safe area
+     (--dshm-safe-shortfall, computed at runtime) — stacking the full
+     safe-bottom on top of the app's gap would leave an empty strip in
+     standalone PWA mode. */
   [data-dsh-mobile] [data-composer-seat] {
-    padding-bottom: calc(var(--dshm-safe-bottom) + var(--dshm-keyboard-inset));
+    padding-bottom: calc(var(--dshm-keyboard-inset) + var(--dshm-safe-shortfall, 0px));
   }
 
   /* Hidden scrollbars are the norm on phones: no reserved gutter, no bars. */
   [data-dsh-mobile] [data-conversation-scroll] {
     scrollbar-gutter: auto;
+    /* Tell the browser how much of the bottom is behind the virtual
+       keyboard, so any auto-scroll (focus-into-view) lands the target in
+       the visible region instead of flush against the keyboard. */
+    scroll-padding-bottom: var(--dshm-keyboard-inset, 0px);
   }
 
   /* Touch targets in the control regions: header, composer, and sidebar
      rows get a comfortable hit height (kept off inline message chrome,
-     which would stretch rows). */
-  [data-dsh-mobile] [data-phase='active'] > header button,
+     which would stretch rows). The header guard excludes the takeover
+     panels' own title bars (see the top-bar rules above). */
+  [data-dsh-mobile] [data-phase='active'] header:not([data-composer-seat] *) button,
   [data-dsh-mobile] [data-composer-card] button,
   [data-dsh-mobile] [role='treeitem'] button {
     min-height: 36px;
@@ -273,6 +345,74 @@
   [data-dsh-mobile] [role='dialog'] textarea {
     font-size: 16px;
   }
+}
+
+/* ---------- approval panel (tool waiting for permission) ---------- */
+
+/* The approval panel replaces the composer while a tool waits for the user
+   to grant or reject one request. On phones it must be clearly visible and
+   comfortably tappable — a missed approval strands the command. Structural
+   hooks only: [data-approval-key] on the panel root, [data-approval-scroll]
+   on the detail body, and the 拒绝/允许一次 buttons inside. */
+[data-dsh-mobile] [data-approval-key] {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+[data-dsh-mobile] [data-approval-key] button {
+  min-height: 44px;
+  padding-left: 16px;
+  padding-right: 16px;
+  font-size: 16px;
+}
+
+[data-dsh-mobile] [data-approval-key] [data-approval-scroll] {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ---------- pending-interaction banner (non-current session waiting) ---------- */
+
+/* A session other than the current one is waiting on the user (approval,
+   question, plan review). The app's own indicator is a 10px dot on a row
+   inside a workspace group — invisible on a phone. This banner floats at
+   the top of the screen, one tap away from jumping to the waiting session.
+   Element: <button data-dshm-pending-banner> appended by the controller. */
+[data-dsh-mobile] [data-dshm-pending-banner] {
+  position: fixed;
+  top: calc(env(safe-area-inset-top, 0px) + 8px);
+  left: 12px;
+  right: 12px;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 12px 16px;
+  border: 1px solid var(--dsw-alias-state-warn-secondary);
+  border-radius: 14px;
+  background: var(--dsw-specific-input-major);
+  color: var(--dsw-alias-label-primary);
+  box-shadow: var(--dsw-shadow-lv2);
+  font-size: 14px;
+  line-height: 20px;
+  text-align: left;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+[data-dsh-mobile] [data-dshm-pending-banner]::before {
+  content: '';
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-warn-primary);
+  animation: dshm-pending-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes dshm-pending-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }
 
 /* Coarse pointers (touch) never hover: drop scrollbars entirely. */
