@@ -271,6 +271,19 @@
   [data-dsh-mobile] [role='treeitem'] button {
     min-height: 36px;
   }
+
+  /* Composer button row on phones: the model selector (label + effort +
+     chevron) wants ~178px — half the 358px card — squeezing the other five
+     controls into the rest of the line. Clamp every card button to a
+     compact width; the only control that exceeds it is the model selector,
+     whose label truncates instead of crowding the row (all other buttons
+     are already narrower, so this is a no-op for them). */
+  [data-dsh-mobile] [data-composer-card] button {
+    max-width: 96px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
 
 /* ---------- settings dialog (and any nav+content dialog) ---------- */
