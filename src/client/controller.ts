@@ -62,7 +62,9 @@ const HEADER_EXPAND_SLOP = 12
 const HEADER_QUIET_MS = 600
 
 /** Static home-screen icon shipped with the plugin and served by the harness
- *  at /plugins/<id>/<file> — a REAL URL (Firefox ignores data-URI icons). */
+ *  at /plugins/<id>/<file> — a REAL URL (Firefox ignores data-URI icons).
+ *  It is an opaque brand tile, so it is legible as a light or dark fallback
+ *  without any prefers-color-scheme handling here. */
 const PLUGIN_ICON_URL = '/plugins/@dsh-external/dsh-mobile/icon.png'
 
 /** The sidebar shell's collapse toggle labels (zh / en) — clicking it while
@@ -509,12 +511,12 @@ export class MobileController implements MobileControllerHandle {
   }
 
   /** iOS home-screen icon. In this deployment the server-rendered index
-   *  already carries the apple-touch-icon links (and the manifest ships the
-   *  PNG icon), so this early-returns. The injection below only matters on a
-   *  stock harness whose index was not patched: it re-adds the icon and the
-   *  iOS meta, preferring the plugin's statically served PNG (a real URL —
-   *  Firefox/iOS ignore data URIs) with a runtime-rasterized whale as the
-   *  standalone fallback. */
+   *  already carries the apple-touch-icon links (including the dark variant)
+   *  and the manifest ships the opaque PNG icon, so this early-returns. The
+   *  injection below only matters on a stock harness whose index was not
+   *  patched: it re-adds the icon and the iOS meta, preferring the plugin's
+   *  statically served PNG (a real URL — Firefox/iOS ignore data URIs) with
+   *  a runtime-rasterized whale as the standalone fallback. */
   async #installPwaAssets(): Promise<void> {
     const head = document.head
     if (head === null || head.querySelector('link[rel="apple-touch-icon"]') !== null) return
@@ -529,9 +531,9 @@ export class MobileController implements MobileControllerHandle {
           // Drop the scheme-dependent <style> — the Path2D rasterizer fills
           // the whale itself, so the path's own attributes don't matter.
           .replace(/<style>[\s\S]*?<\/style>/g, '')
-        iconUrl = await this.#rasterizeSvg(svg, '#ffffff')
+        iconUrl = await this.#rasterizeSvg(svg, '#3964fe', '#ffffff')
       } catch {
-        iconUrl = this.#drawFallbackIcon('#ffffff')
+        iconUrl = this.#drawFallbackIcon('#3964fe', '#ffffff')
       }
     }
     if (iconUrl === null) return
@@ -560,7 +562,7 @@ export class MobileController implements MobileControllerHandle {
    *  (it silently fails and the icon would fall back to a letter), while the
    *  path data in the shipped favicon is stable. The favicon viewBox is
    *  50×50; the whale is drawn padded inside the 180×180 canvas. */
-  async #rasterizeSvg(svg: string, background: string): Promise<string> {
+  async #rasterizeSvg(svg: string, background: string, foreground: string): Promise<string> {
     const SIZE = 180
     const pathMatch = /<path[^>]*\bd="([^"]*)"/.exec(svg)
     if (pathMatch === null) throw new Error('no path in favicon')
@@ -575,14 +577,14 @@ export class MobileController implements MobileControllerHandle {
     const pad = Math.round(SIZE * 0.18)
     ctx.translate(pad, pad)
     ctx.scale((SIZE - pad * 2) / 50, (SIZE - pad * 2) / 50)
-    ctx.fillStyle = '#000000'
+    ctx.fillStyle = foreground
     ctx.fill(whale)
     return canvas.toDataURL('image/png')
   }
 
-  /** Brand-color square with a white "D" — used when the favicon fetch or
-   *  rasterization fails. */
-  #drawFallbackIcon(background: string): string {
+  /** Opaque tile with the whale fallback letter — used when the favicon
+   *  fetch or rasterization fails. */
+  #drawFallbackIcon(background: string, foreground: string): string {
     const SIZE = 180
     const canvas = document.createElement('canvas')
     canvas.width = SIZE
@@ -591,7 +593,7 @@ export class MobileController implements MobileControllerHandle {
     if (ctx === null) return ''
     ctx.fillStyle = background
     ctx.fillRect(0, 0, SIZE, SIZE)
-    ctx.fillStyle = '#000000'
+    ctx.fillStyle = foreground
     ctx.font = 'bold 120px system-ui, -apple-system, sans-serif'
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'

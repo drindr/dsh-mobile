@@ -21,7 +21,12 @@
     "tests",
     "cordis.patch.yml",
     "dsh.plugin.json",
-    "icon.png"
+    "icon.png",
+    "icon-512.png",
+    "icon-1024.png",
+    "icon-dark.png",
+    "icon-dark-512.png",
+    "icon-dark-1024.png"
   ],
   "scripts": {
     "build": "tsdown",
