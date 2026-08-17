@@ -277,8 +277,15 @@
      controls into the rest of the line. Clamp every card button to a
      compact width; the only control that exceeds it is the model selector,
      whose label truncates instead of crowding the row (all other buttons
-     are already narrower, so this is a no-op for them). */
-  [data-dsh-mobile] [data-composer-card] button {
+     are already narrower, so this is a no-op for them).
+
+     Popovers the app mounts INSIDE the composer card's DOM subtree (the
+     model/effort dropdown menus and the command-picker listbox render
+     in-place, not in a portal) must NOT inherit the clamp: their option
+     buttons would truncate at 96px even while the menu is open. role=menu
+     / role=listbox are stable ARIA hooks, same as every other structural
+     selector in this sheet. */
+  [data-dsh-mobile] [data-composer-card] button:not([role='menu'] *):not([role='listbox'] *) {
     max-width: 96px;
     white-space: nowrap;
     overflow: hidden;
