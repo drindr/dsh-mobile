@@ -18,7 +18,9 @@
    PiUI's overlayWidth idea) and the chat page is full-width, so swiping to
    the sidebar still shows the chat peeking out on the right. Both cards are
    rounded and shadowed, PiUI style. The controller keeps the sidebar
-   expanded (native wide rendering) and flips the pager on state changes. */
+   expanded (native wide rendering) and flips the pager on state changes. A
+   plugin occupying the details slot (ThreadTrail) can opt into a THIRD
+   full-width page right of the chat via [data-dshm-details-page]. */
 
 /* ---------- tokens ---------- */
 [data-dsh-mobile] {
@@ -35,11 +37,6 @@
      card then shows only a sliver on the right (PiUI's overlayWidth idea,
      tightened so the chat does not dominate). */
   --dshm-sidebar-width: clamp(280px, 70vw, 360px);
-  /* PiUI-style 3D flip of the chat card, driven by the controller on scroll. */
-  --dshm-rotate: 0deg;
-  --dshm-scale: 1;
-  --dshm-offset-x: 0px;
-  --dshm-origin-x: 50% 50%;
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -74,14 +71,18 @@
 /* ---------- mobile pager (narrow viewports) ---------- */
 
 @media (max-width: 768px) {
-  /* The AppFrame keeps at least one of its two data attributes in every
-     state; the union selects the frame on any viewport. Reflow the grid
-     tracks into two snap pages: the sidebar page at the half-open width,
-     the chat page full-width (so the chat stays visible beside the
-     sidebar), the details track dropped (no phone use). */
-  [data-dsh-mobile] div[data-sidebar-collapsed],
-  [data-dsh-mobile] div[data-details-collapsed] {
+  /* The frame selector keys off the AppFrame's overlay layer, a direct
+     child rendered in EVERY collapse state (the both-panels-open frame
+     carries neither data attribute). Reflow the grid tracks into two snap
+     pages: the sidebar page at the half-open width, the chat page
+     full-width, the details track dropped (unless a plugin opted into the
+     third page — see the details-page block below). Track changes must not
+     animate: the desktop grid-template-columns transition would turn the
+     third page's appear/disappear into a scrollport-width animation
+     mid-swipe. */
+  [data-dsh-mobile] div:has(> [data-shell-overlay]) {
     grid-template-columns: var(--dshm-sidebar-width) 100% 0 !important;
+    transition: none !important;
     overflow-x: auto;
     overflow-y: hidden;
     overscroll-behavior-x: contain;
@@ -90,8 +91,7 @@
   }
 
   /* Hide the pager's own horizontal scrollbar on every engine. */
-  [data-dsh-mobile] div[data-sidebar-collapsed]::-webkit-scrollbar,
-  [data-dsh-mobile] div[data-details-collapsed]::-webkit-scrollbar {
+  [data-dsh-mobile] div:has(> [data-shell-overlay])::-webkit-scrollbar {
     width: 0;
     height: 0;
     display: none;
@@ -99,8 +99,7 @@
 
   /* The two live pages snap to the scrollport start (scroll-snap-stop keeps
      a fast swipe from skipping a page). */
-  [data-dsh-mobile] div[data-sidebar-collapsed] > :nth-child(-n+2),
-  [data-dsh-mobile] div[data-details-collapsed] > :nth-child(-n+2) {
+  [data-dsh-mobile] div:has(> [data-shell-overlay]) > :nth-child(-n+2) {
     scroll-snap-align: start;
     scroll-snap-stop: always;
   }
@@ -111,8 +110,7 @@
      what separate the two (PiUI). The sidebar column itself is already
      bg-base; the sidebar shell's own fill is reset to transparent so every
      layer of the sidebar matches the chat. */
-  [data-dsh-mobile] div[data-sidebar-collapsed] > :first-child,
-  [data-dsh-mobile] div[data-details-collapsed] > :first-child {
+  [data-dsh-mobile] div:has(> [data-shell-overlay]) > :first-child {
     background: var(--dsw-alias-bg-base);
     border-right: none;
     padding-top: var(--dshm-safe-top);
@@ -124,56 +122,73 @@
      sidebar in an extra div) — so every layer of the sidebar page matches
      the chat background. Deeper elements keep their own states (hover,
      active) untouched. */
-  [data-dsh-mobile] div[data-sidebar-collapsed] > :first-child > :first-child,
-  [data-dsh-mobile] div[data-details-collapsed] > :first-child > :first-child,
-  [data-dsh-mobile] div[data-sidebar-collapsed] > :first-child > :first-child > :first-child,
-  [data-dsh-mobile] div[data-details-collapsed] > :first-child > :first-child > :first-child {
+  [data-dsh-mobile] div:has(> [data-shell-overlay]) > :first-child > :first-child,
+  [data-dsh-mobile] div:has(> [data-shell-overlay]) > :first-child > :first-child > :first-child {
     background: transparent;
   }
 
   /* Chat page: the PiUI rounded card — rounded and shadowed, clipped to the
      radius, no border so no divider line sits between it and the sidebar.
-     The conversation renders completely untouched inside. The transform is
-     identity when the pager rests on the chat page (progress 0), so the
-     override below drops it to `none` there — a giant pinned 3D layer of
-     the whole conversation column is the mobile jank source. NO 3D
-     transform context at rest (transform-style/backface-visibility live
-     under [data-dshm-flipping] only): iOS Safari mis-renders elements that
-     MOUNT inside a preserve-3d context — the approval/question takeover
-     panels flashed once and never painted again. */
-  [data-dsh-mobile] div[data-sidebar-collapsed] > :nth-child(2),
-  [data-dsh-mobile] div[data-details-collapsed] > :nth-child(2) {
+     The conversation renders completely untouched inside. NO transform, NO
+     will-change, at any time: an earlier PiUI-style card flip animated a
+     transform on this whole column per scroll frame, re-rasterizing a
+     ~390×844 layer every frame — far too heavy for phone GPUs (iPhone
+     Air). The scroll-snap pager motion alone is compositor-free, and a
+     pinned transformed layer here would also mis-anchor position:fixed
+     descendants inside the conversation. */
+  [data-dsh-mobile] div:has(> [data-shell-overlay]) > :nth-child(2) {
     border: none;
     border-radius: 16px;
     overflow: hidden;
     background: var(--dsw-alias-bg-base);
     box-shadow: 0 6px 28px color-mix(in srgb, var(--dsw-static-neutral-1000) 16%, transparent);
-    transform: translate3d(var(--dshm-offset-x, 0px), 0, 0)
-      rotateY(var(--dshm-rotate, 0deg))
-      scale(var(--dshm-scale, 1));
-    transform-origin: var(--dshm-origin-x, 50% 50%);
   }
 
-  /* Pager at rest on the chat page (no flip live): the identity transform
-     above becomes `none`, releasing the conversation column's 3D layer —
-     at rest it is plain 2D content again (scrolls composit on the cheap).
-     The controller sets [data-dshm-flipping] while a flip is live. */
-  [data-dsh-mobile]:not([data-dshm-flipping]) div[data-sidebar-collapsed] > :nth-child(2),
-  [data-dsh-mobile]:not([data-dshm-flipping]) div[data-details-collapsed] > :nth-child(2) {
-    transform: none;
-    transform-style: flat;
-    backface-visibility: visible;
+  /* ---------- third pager page: details (opt-in) ---------- */
+
+  /* A plugin occupying the details slot (ThreadTrail) opts in by setting
+     [data-dshm-details-page] on <html>: the details track becomes a
+     full-width THIRD snap page to the right of the chat page
+     (sidebar | chat | details), revealed by a left swipe from the chat.
+     AppFrame's computeColumns forces the details track to 0 on narrow
+     viewports and its data-details-collapsed attribute never lifts here,
+     but a closed details column is only visually closed, never unmounted —
+     so the opt-in ALONE decides, and the extra specificity (the opt-in
+     attribute) overrides the two-page track list above. */
+  [data-dsh-mobile][data-dshm-details-page] div:has(> [data-shell-overlay]) {
+    grid-template-columns: var(--dshm-sidebar-width) 100% 100% !important;
   }
 
-  /* The 3D layer (preserve-3d + hidden backface + will-change) is granted
-     only while a flip is actually live: at rest the card must not pin a 3D
-     transform context or a will-change layer on phones — both are the iOS
-     mis-render source for panels that mount inside the card. */
-  [data-dsh-mobile][data-dshm-flipping] div[data-sidebar-collapsed] > :nth-child(2),
-  [data-dsh-mobile][data-dshm-flipping] div[data-details-collapsed] > :nth-child(2) {
-    transform-style: preserve-3d;
-    backface-visibility: hidden;
-    will-change: transform;
+  /* The details page: a plain full-width page sharing the chat background
+     (like the sidebar page), with safe-area top, snapping to the
+     scrollport start like the other two pages. */
+  [data-dsh-mobile][data-dshm-details-page] div:has(> [data-shell-overlay]) > :nth-child(3) {
+    scroll-snap-align: start;
+    scroll-snap-stop: always;
+    background: var(--dsw-alias-bg-base);
+    border-left: none;
+    padding-top: var(--dshm-safe-top);
+    /* The details slot carries a FULLY rendered ThreadTrail panel (~18k DOM
+       nodes). Rendered eagerly, it joins every whole-document style/layout
+       pass while sitting offscreen (measured: 200ms median per layout
+       flush on a DESKTOP CPU, several times that on a phone) and its
+       textures pressure the GPU into evicting the chat/sidebar pages —
+       every swipe then pays a re-raster. content-visibility:auto cannot
+       help here: at rest on the chat page the details page sits flush
+       against the viewport edge, inside the relevance margin, so "auto"
+       never skips it. Keep it HIDDEN (fully skipped: style+layout+paint)
+       until the pager actually approaches — the controller sets
+       [data-dshm-near-details] once a swipe crosses ~8% toward it (rule
+       below), early enough to be painted by arrival. The grid track keeps
+       its size, so the scrollport math is unaffected. */
+    content-visibility: hidden;
+    contain-intrinsic-size: auto 844px;
+  }
+
+  /* Approaching (or resting on) the details page: hand rendering back to
+     the browser's relevance heuristics. */
+  [data-dsh-mobile][data-dshm-details-page][data-dshm-near-details] div:has(> [data-shell-overlay]) > :nth-child(3) {
+    content-visibility: auto;
   }
 
   /* The session list's bottom scroll fade (ui-workspace .fade, a 72px
@@ -181,8 +196,7 @@
      affordance; on the always-open phone sidebar it just dims the tail of
      the list. Selected structurally (the tree body's span child, next to
      the role=tree list), never by hashed class name. */
-  [data-dsh-mobile] div[data-sidebar-collapsed] > :first-child div:has(> [role='tree']) > span,
-  [data-dsh-mobile] div[data-details-collapsed] > :first-child div:has(> [role='tree']) > span {
+  [data-dsh-mobile] div:has(> [data-shell-overlay]) > :first-child div:has(> [role='tree']) > span {
     display: none;
   }
 

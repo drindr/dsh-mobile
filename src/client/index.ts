@@ -9,7 +9,9 @@
  * Mobile layout follows PiUI's chat pager: the stock three-column frame
  * becomes a horizontal scroll-snap pager (sidebar | chat), the chat column
  * renders completely untouched, and the pager starts on the chat page —
- * swiping reveals the always-open sidebar.
+ * swiping reveals the always-open sidebar. A plugin occupying the details
+ * slot (ThreadTrail) can opt into a third page right of the chat by setting
+ * [data-dshm-details-page] on <html> (see controller.ts).
  */
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only: pulls the layout plugin's Context merge (ctx.layout) and the

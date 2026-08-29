@@ -2,7 +2,7 @@
  * DOM-side mobile controller: the non-React half of the plugin. Owns the
  * pieces the frame itself cannot express — the viewport meta upgrade, the
  * safe-area/keyboard CSS variables, and the pager's live state (page mirror,
- * 3D flip vars, click-to-return). Everything it installs is removed by
+ * click-to-return). Everything it installs is removed by
  * dispose(), and every rule it depends on is scoped under the
  * [data-dsh-mobile] attribute it sets on <html>.
  *
@@ -16,6 +16,16 @@
  * in the sidebar returns to it. The sidebar column keeps its full content
  * rendered at all times (a swipe is never state-synced, so it never
  * re-renders).
+ *
+ * A THIRD page to the right of the chat — sidebar | chat | details — is
+ * opt-in: a plugin occupying the details slot (ThreadTrail) sets the
+ * DETAILS_PAGE_ATTR attribute on <html> and the pager gains a full-width
+ * details page revealed by a left swipe from the chat page. AppFrame's
+ * computeColumns never opens the details track on narrow viewports (its
+ * desktop fit math forces it to 0), but a closed details column is only
+ * visually closed, never unmounted — the CSS simply gives the track a page
+ * while the opt-in is present. Without the opt-in the details track is
+ * dropped and the pager is exactly the classic two pages.
  */
 
 /** The narrow breakpoint the pager keys off (PiUI's 768px). */
@@ -24,8 +34,28 @@ export const MOBILE_BREAKPOINT = '(max-width: 768px)'
 /** The <html> attribute that mirrors the pager page the frame is resting on. */
 export const PAGE_ATTR = 'data-dshm-page'
 
+/** The <html> opt-in attribute for the THIRD pager page: another plugin
+ *  (ThreadTrail) sets it to declare "the details column is a mobile page".
+ *  While it is present the pager becomes sidebar | chat | details — a left
+ *  swipe from the chat page reveals the details page; without it the pager
+ *  stays the classic two pages and the details track is dropped. */
+export const DETAILS_PAGE_ATTR = 'data-dshm-details-page'
+
+/** Set on <html> while the pager is close enough to the details page that
+ *  it must be RENDERED. The details slot can carry a huge always-mounted
+ *  panel (ThreadTrail: ~18k DOM nodes); at rest on the chat page it sits
+ *  flush against the viewport edge, inside the content-visibility:auto
+ *  relevance margin — so "auto" never skips it (measured: 200ms median
+ *  full-document layout flush with it rendered, 74ms hidden, desktop CPU).
+ *  The CSS keeps it content-visibility:hidden until this attribute lands. */
+const NEAR_DETAILS_ATTR = 'data-dshm-near-details'
+
+/** Fraction of a page the pager must move toward the details page before
+ *  it starts rendering (early enough to be painted by arrival). */
+const DETAILS_REVEAL_FRACTION = 0.08
+
 /** Pager page names (the mirror values of PAGE_ATTR). */
-export type MobilePage = 'sidebar' | 'chat'
+export type MobilePage = 'sidebar' | 'chat' | 'details'
 
 /** Wait after the last scroll event before the pager settles. */
 const SCROLL_SETTLE_MS = 200
@@ -103,6 +133,8 @@ interface ChatLeftCache {
   frame: HTMLElement
   /** The measured sidebar column width (px). */
   left: number
+  /** The scrollport width (px) — the full-width chat/details page width. */
+  pageWidth: number
 }
 
 /** Callbacks the controller needs from the apply world. */
@@ -171,6 +203,8 @@ export class MobileController implements MobileControllerHandle {
   /** Original .focus() implementations (restored on uninstall). */
   #iosFocusOriginals: Array<{ proto: { prototype: { focus: Function } }; orig: Function }> = []
   #mountFrame: number | null = null
+  /** True while a details-reveal check is scheduled (see #onPagerScroll). */
+  #detailsRevealScheduled = false
   #resizeTimer: number | null = null
   #settleTimer: number | null = null
   /** Pointer-down position for tap-vs-swipe discrimination. */
@@ -190,6 +224,12 @@ export class MobileController implements MobileControllerHandle {
   #composerPollTimer: number | null = null
   /** Picks up composer input mounts (the seat remounts on session switches). */
   #composerObserver: MutationObserver | null = null
+  /** The frame the composer observer is bound to (its callback's re-scan root). */
+  #frame: HTMLElement | null = null
+  /** Measures the floating header's height without forced layout reads. */
+  #headerResizeObserver: ResizeObserver | null = null
+  /** The header element currently observed (re-observe when it remounts). */
+  #observedHeader: HTMLElement | null = null
   /** The conversation's scroll container (top-bar auto-collapse). */
   #conversationScroll: HTMLElement | null = null
   /** Settle timer for the top-bar evaluation (140 ms quiet window). */
@@ -199,15 +239,12 @@ export class MobileController implements MobileControllerHandle {
   /** Layout-induced scroll noise is ignored until this time (see #settleHeader). */
   #headerQuietUntil = 0
   #expandPending = false
+  /** Watches <html> for the DETAILS_PAGE_ATTR opt-in landing after this
+   *  plugin mounted (plugin load order is not guaranteed). */
+  #pageAttrObserver: MutationObserver | null = null
   /** Cached chat-page snap position (measure once per stable layout, never
    *  inside a scroll handler — reading offsetWidth there forces layout). */
   #chatLeftCache: ChatLeftCache | null = null
-  /** Flip vars are suspended during a programmatic session-switch jump: the
-   *  switch re-renders the conversation column on the main thread, so the
-   *  jump must not pay per-frame 3D compositing on top of that render. */
-  #flipSuppressed = false
-  /** Last flip progress written (skip no-op style writes between frames). */
-  #lastFlipProgress: number | null = null
   #mounted = false
   #disposed = false
 
@@ -224,17 +261,10 @@ export class MobileController implements MobileControllerHandle {
 
   /** Return to the chat page (a session picked in the sidebar). Pure scroll —
    *  the sidebar state is untouched, so its content stays rendered. The jump
-   *  is INSTANT with flip vars suppressed: picking a session re-renders the
-   *  conversation column on the main thread, so a smooth scroll with
-   *  per-frame 3D updates would fight that render and jank on phones. */
+   *  is INSTANT: picking a session re-renders the conversation column on the
+   *  main thread, so a smooth scroll would fight that render and jank. */
   returnToChat(): void {
-    this.#flipSuppressed = true
     this.#placeOnChat('auto')
-    // Snap the flip vars straight to rest — no intermediate frames.
-    const frame = findFrame()
-    if (frame !== null) this.#setFlipVars(frame, 0)
-    this.#html?.removeAttribute('data-dshm-flipping')
-    this.#lastFlipProgress = 0
   }
 
   /** Show or hide the pending-interaction banner. The app's own pending
@@ -282,7 +312,7 @@ export class MobileController implements MobileControllerHandle {
   readonly #measureChatLeft = (frame: HTMLElement): number => {
     const sidebar = frame.firstElementChild
     if (sidebar instanceof HTMLElement && sidebar.offsetWidth > 0) {
-      this.#chatLeftCache = { frame, left: sidebar.offsetWidth }
+      this.#chatLeftCache = { frame, left: sidebar.offsetWidth, pageWidth: frame.clientWidth }
       return sidebar.offsetWidth
     }
     return frame.clientWidth
@@ -298,20 +328,30 @@ export class MobileController implements MobileControllerHandle {
     return this.#measureChatLeft(frame)
   }
 
+  /** The full-width page width (the scrollport width — chat and details
+   *  pages are both 100% tracks). Cached alongside the chat-page position. */
+  readonly #pageWidth = (frame: HTMLElement): number => {
+    const cache = this.#chatLeftCache
+    if (cache !== null && cache.frame === frame && cache.pageWidth > 0) return cache.pageWidth
+    return frame.clientWidth
+  }
+
+  /** True while the THIRD pager page (details | ThreadTrail) is live: a
+   *  plugin opted in via DETAILS_PAGE_ATTR. The frame's
+   *  data-details-collapsed attribute is NOT consulted: AppFrame's
+   *  computeColumns forces the details track to 0 on narrow viewports (its
+   *  desktop three-column fit math), so the attribute never lifts on a
+   *  phone — but a closed details column is only visually closed, never
+   *  unmounted, so the CSS gives the track a full-width page whenever the
+   *  opt-in is present. */
+  readonly #detailsPageOpen = (): boolean => {
+    return this.#html?.hasAttribute(DETAILS_PAGE_ATTR) ?? false
+  }
+
   /** Drop the cached snap position (viewport reflow / breakpoint crossing);
    *  the next read re-measures from the live layout. */
   readonly #invalidateChatLeft = (): void => {
     this.#chatLeftCache = null
-  }
-
-  /** Write the four flip vars for a given pager progress (-1 … 0). */
-  readonly #setFlipVars = (frame: HTMLElement, progress: number): void => {
-    const abs = Math.abs(progress)
-    const right = Math.max(0, progress)
-    frame.style.setProperty('--dshm-rotate', `${progress * 10}deg`)
-    frame.style.setProperty('--dshm-scale', `${1 - abs * 0.06}`)
-    frame.style.setProperty('--dshm-offset-x', `${right * right * -48}px`)
-    frame.style.setProperty('--dshm-origin-x', `${50 - progress * 50}%`)
   }
 
   /** Paint the document canvas with the app's actual background (theme
@@ -342,7 +382,11 @@ export class MobileController implements MobileControllerHandle {
 
   /** The overlay header no longer occupies layout space; the scroll body pads
    *  its top by the header's natural height so the first content rests below
-   *  the floating bar. Measure it into --dshm-header-h. */
+   *  the floating bar. Measure it into --dshm-header-h. Only call this at
+   *  setup / explicit re-measure points — getBoundingClientRect forces a
+   *  synchronous layout, so it must never ride a MutationObserver batch
+   *  (that was the streaming jank). Size changes after attach are tracked
+   *  by the ResizeObserver in #attachHeaderMeasure (no layout read). */
   readonly #syncHeaderHeight = (): void => {
     const html = this.#html
     if (html === null) return
@@ -352,6 +396,70 @@ export class MobileController implements MobileControllerHandle {
     if (header === null) return
     const h = Math.round(header.getBoundingClientRect().height)
     if (h > 0) html.style.setProperty('--dshm-header-h', `${h}px`)
+  }
+
+  /** Filtered frame-structure watcher. Streaming message content mutates
+   *  the frame subtree constantly; re-scanning the seats on every batch was
+   *  the streaming jank source. Two cheap paths cover every real change:
+   *  1. O(1) disconnect check — a session switch REPLACES the seat elements,
+   *     so a tracked element going disconnected means "re-scan now".
+   *  2. Only while a seat is missing (never found, or just detached), scan
+   *     the added nodes for the seat containers themselves. Streaming adds
+   *     content INSIDE the containers, never the containers, so streaming
+   *     batches are skipped here (a leaf matches/querySelector is cheap). */
+  readonly #onFrameStructureMutation = (mutations: MutationRecord[]): void => {
+    const frame = this.#frame
+    if (frame === null) return
+    const inputGone = this.#composerInput !== null && !this.#composerInput.isConnected
+    const scrollGone = this.#conversationScroll !== null && !this.#conversationScroll.isConnected
+    if (inputGone || scrollGone) {
+      // A remount (session switch) also replaces the header — re-measure.
+      this.#attachComposerInput(frame)
+      this.#attachConversationScroll(frame)
+      this.#attachHeaderMeasure()
+      return
+    }
+    if (this.#composerInput !== null && this.#conversationScroll !== null
+      && this.#observedHeader !== null) return
+    for (const mutation of mutations) {
+      const nodes = mutation.addedNodes
+      for (let i = 0; i < nodes.length; i++) {
+        const node = nodes[i]
+        if (node === undefined || node.nodeType !== 1) continue
+        const el = node as Element
+        if (el.matches?.('[data-composer-seat], [data-conversation-scroll], [data-phase] header') === true
+          || el.querySelector?.('[data-composer-seat], [data-conversation-scroll]') != null
+          // The input can mount inside an already-present composer seat.
+          || el.closest?.('[data-composer-seat]') !== null) {
+          this.#attachComposerInput(frame)
+          this.#attachConversationScroll(frame)
+          this.#attachHeaderMeasure()
+          return
+        }
+      }
+    }
+  }
+
+  /** Track the floating header's height with a ResizeObserver (async, no
+   *  forced layout) instead of measuring it per mutation batch. Re-observes
+   *  when the header element is replaced (session switches remount it). */
+  readonly #attachHeaderMeasure = (): void => {
+    const header = document.querySelector<HTMLElement>(
+      '[data-phase="active"] header:not([data-composer-seat] *)',
+    )
+    if (header === this.#observedHeader) return
+    this.#headerResizeObserver?.disconnect()
+    this.#observedHeader = header
+    if (header === null) return
+    if (typeof ResizeObserver !== 'undefined') {
+      this.#headerResizeObserver ??= new ResizeObserver((entries) => {
+        const h = Math.round(entries[0]?.contentRect.height ?? 0)
+        if (h > 0) this.#html?.style.setProperty('--dshm-header-h', `${h}px`)
+      })
+      this.#headerResizeObserver.observe(header)
+    }
+    // One explicit initial measure (a single layout read at attach time).
+    this.#syncHeaderHeight()
   }
 
   /** Install the controller. Safe to call once; a second call is a no-op.
@@ -410,6 +518,23 @@ export class MobileController implements MobileControllerHandle {
     }
     this.#ensureFrameObserver()
 
+    // The third-page opt-in may land AFTER this plugin mounted (plugin load
+    // order is not guaranteed): watch <html> for it and expand the details
+    // page when it arrives.
+    this.#pageAttrObserver = new MutationObserver(() => {
+      // The opt-in toggles the page COUNT (the scrollport grows/shrinks by
+      // a full page): drop the cached geometry and re-snap onto the page
+      // the user is looking at.
+      this.#invalidateChatLeft()
+      const frame = findFrame()
+      if (frame !== null && (this.#mql?.matches ?? false)) {
+        frame.scrollTo({ left: this.#nearestPageLeft(frame, frame.scrollLeft), behavior: 'auto' })
+        this.#mirrorPage(frame)
+        this.#syncDetailsReveal(frame)
+      }
+    })
+    this.#pageAttrObserver.observe(html, { attributes: true, attributeFilter: [DETAILS_PAGE_ATTR] })
+
     // The always-open phone layout: expand the sidebar once (AppFrame
     // auto-collapses it to the rail on narrow viewports) so its content
     // stays fully rendered, then start on the CHAT page.
@@ -438,10 +563,16 @@ export class MobileController implements MobileControllerHandle {
     this.#frameObserver = null
     this.#rootObserver?.disconnect()
     this.#rootObserver = null
+    this.#pageAttrObserver?.disconnect()
+    this.#pageAttrObserver = null
     this.#approvalObserver?.disconnect()
     this.#approvalObserver = null
     this.#composerObserver?.disconnect()
     this.#composerObserver = null
+    this.#frame = null
+    this.#headerResizeObserver?.disconnect()
+    this.#headerResizeObserver = null
+    this.#observedHeader = null
     this.#detachComposerInput()
     this.#detachConversationScroll()
     this.#removeIosFocusCompensations()
@@ -482,7 +613,7 @@ export class MobileController implements MobileControllerHandle {
     if (html !== null) {
       html.removeAttribute('data-dsh-mobile')
       html.removeAttribute(PAGE_ATTR)
-      html.removeAttribute('data-dshm-flipping')
+      html.removeAttribute(NEAR_DETAILS_ATTR)
       html.removeAttribute('data-dshm-header-collapsed')
       html.style.removeProperty('--dshm-keyboard-inset')
       html.style.removeProperty('--dshm-safe-shortfall')
@@ -490,8 +621,8 @@ export class MobileController implements MobileControllerHandle {
     }
     this.#unpinLayoutHeight()
     this.#chatLeftCache = null
-    this.#flipSuppressed = false
-    this.#lastFlipProgress = null
+    this.#detailsRevealScheduled = false
+    this.#expandPending = false
     this.#html = null
   }
 
@@ -620,6 +751,7 @@ export class MobileController implements MobileControllerHandle {
     this.#options.toggleSidebar()
   }
 
+
   /** Scroll the pager to the chat page and mirror the resting page. */
   readonly #placeOnChat = (behavior: ScrollBehavior): void => {
     const frame = findFrame()
@@ -631,18 +763,33 @@ export class MobileController implements MobileControllerHandle {
       frame.scrollTo({ left: chatLeft, behavior })
     }
     this.#mirrorPage(frame, 'chat')
-    this.#updateFlipVars(frame)
   }
 
-  /** Mirror the page the pager is resting on (scroll position decides). */
+  /** Mirror the page the pager is resting on (scroll position decides),
+   *  written at settle/programmatic-jump time only — nothing consumes the
+   *  attribute mid-gesture, and per-frame writes would invalidate style on
+   *  every scroll frame. The attribute is only written when the value
+   *  actually changes: a same-value setAttribute still invalidates style.
+   *  With the third page live (DETAILS_PAGE_ATTR + details expanded) the
+   *  zones are sidebar | chat | details; otherwise the classic
+   *  sidebar | chat. */
   readonly #mirrorPage = (frame: HTMLElement, hint?: MobilePage): void => {
     const html = this.#html
     if (html === null) return
     const chatLeft = this.#chatPageLeft(frame)
-    const page: MobilePage = chatLeft <= 0
-      ? (hint ?? 'chat')
-      : frame.scrollLeft < chatLeft / 2 ? 'sidebar' : 'chat'
-    html.setAttribute(PAGE_ATTR, page)
+    const scrollLeft = frame.scrollLeft
+    let page: MobilePage
+    if (chatLeft <= 0) {
+      page = hint ?? 'chat'
+    } else if (scrollLeft < chatLeft / 2) {
+      page = 'sidebar'
+    } else if (this.#detailsPageOpen()
+      && scrollLeft > chatLeft + this.#pageWidth(frame) / 2) {
+      page = 'details'
+    } else {
+      page = 'chat'
+    }
+    if (html.getAttribute(PAGE_ATTR) !== page) html.setAttribute(PAGE_ATTR, page)
   }
 
   /** State flips no longer drive the pager (the page is user-driven); an
@@ -658,26 +805,27 @@ export class MobileController implements MobileControllerHandle {
     this.#frameObserver = new MutationObserver(this.#onFrameCollapseChange)
     this.#frameObserver.observe(frame, {
       attributes: true,
-      attributeFilter: ['data-sidebar-collapsed'],
+      attributeFilter: ['data-sidebar-collapsed', 'data-details-collapsed'],
     })
-    // Live pager driving (3D flip + settle re-snap) rides the frame's own
+    // Live pager driving (settle re-snap) rides the frame's own
     // scroll. Pointer tracking backs the one-tap session-switch guarantee
     // (see #onPagerPointerUp).
     frame.addEventListener('scroll', this.#onPagerScroll, { passive: true })
     frame.addEventListener('pointerdown', this.#onPagerPointerDown, { passive: true })
     frame.addEventListener('pointerup', this.#onPagerPointerUp, { passive: true })
     // Composer input + conversation-scroll tracking: the seats remount on
-    // session switches, so re-find them whenever the frame's subtree changes
-    // (dismiss-keyboard-on-send; top-bar auto-collapse).
-    this.#composerObserver = new MutationObserver(() => {
-      this.#attachComposerInput(frame)
-      this.#attachConversationScroll(frame)
-      this.#syncHeaderHeight()
-    })
+    // session switches. The observer callback is FILTERED (see
+    // #onFrameStructureMutation) — an unfiltered re-scan on every frame
+    // subtree mutation ran two whole-tree querySelectors plus a forced
+    // synchronous layout (getBoundingClientRect) per message-streaming
+    // batch: ~2.4s of main-thread time over 6s of light streaming on a
+    // DESKTOP CPU, several times worse on a phone (the streaming jank).
+    this.#frame = frame
+    this.#composerObserver = new MutationObserver(this.#onFrameStructureMutation)
     this.#composerObserver.observe(frame, { childList: true, subtree: true })
     this.#attachComposerInput(frame)
     this.#attachConversationScroll(frame)
-    this.#syncHeaderHeight()
+    this.#attachHeaderMeasure()
     // A frame that appears after mount (the layout entry loads later) still
     // gets the always-open treatment and starts on the chat page.
     this.#ensureSidebarOpen()
@@ -685,20 +833,14 @@ export class MobileController implements MobileControllerHandle {
   }
 
   /** Crossing the breakpoint: entering mobile re-expands the sidebar and
-   *  places the pager on the chat page; leaving clears the 3D flip vars so
+   *  places the pager on the chat page; leaving clears the page mirror so
    *  the desktop layout renders flat. */
   readonly #onBreakpointChange = (): void => {
     const mobile = this.#mql?.matches ?? false
-    const frame = findFrame()
     if (!mobile) {
       this.#removeIosFocusCompensations()
-      for (const prop of ['--dshm-rotate', '--dshm-scale', '--dshm-offset-x', '--dshm-origin-x']) {
-        frame?.style.removeProperty(prop)
-      }
       this.#html?.removeAttribute(PAGE_ATTR)
-      this.#html?.removeAttribute('data-dshm-flipping')
-      this.#flipSuppressed = false
-      this.#lastFlipProgress = null
+      this.#html?.removeAttribute(NEAR_DETAILS_ATTR)
       return
     }
     this.#installIosFocusCompensations()
@@ -707,6 +849,8 @@ export class MobileController implements MobileControllerHandle {
     this.#syncComposerSafeShortfall()
     this.#ensureSidebarOpen()
     this.#placeOnChat('auto')
+    const frame = findFrame()
+    if (frame !== null) this.#syncDetailsReveal(frame)
   }
 
   /** Width reflow within one breakpoint side: keep the active page put. */
@@ -724,29 +868,72 @@ export class MobileController implements MobileControllerHandle {
       this.#syncComposerSafeShortfall()
       const chatLeft = this.#chatPageLeft(frame)
       if (chatLeft <= 0) return
-      const onChat = frame.scrollLeft >= chatLeft / 2
-      frame.scrollTo({ left: onChat ? chatLeft : 0, behavior: 'auto' })
+      frame.scrollTo({ left: this.#nearestPageLeft(frame, frame.scrollLeft), behavior: 'auto' })
       this.#mirrorPage(frame)
-      this.#updateFlipVars(frame)
     }, 120)
   }
 
-  /** Live pager driver: PiUI's 3D flip vars follow the scroll, and once the
-   *  scroll settles the pager re-snaps to the nearest whole page (a
-   *  short-of-page stop is nudged). The state is deliberately NOT synced —
-   *  the sidebar stays expanded (always rendered), so a swipe merely parks
-   *  the pager; the sidebar column never re-renders. */
+  /** The snap position of the page nearest to a scroll offset: 0 (sidebar),
+   *  chatLeft (chat), and — while the third page is live — chatLeft +
+   *  pageWidth (details). */
+  readonly #nearestPageLeft = (frame: HTMLElement, left: number): number => {
+    const chatLeft = this.#chatPageLeft(frame)
+    let best = left < chatLeft / 2 ? 0 : chatLeft
+    if (this.#detailsPageOpen()) {
+      const detailsLeft = chatLeft + this.#pageWidth(frame)
+      if (Math.abs(left - detailsLeft) < Math.abs(left - best)) best = detailsLeft
+    }
+    return best
+  }
+
+  /** Live pager driver: once the scroll settles the pager re-snaps to the
+   *  nearest whole page (a short-of-page stop is nudged). The state is
+   *  deliberately NOT synced — the sidebar stays expanded (always rendered),
+   *  so a swipe merely parks the pager; the sidebar column never re-renders.
+   *
+   *  The handler does NOTHING per frame by design: an earlier version drove
+   *  a PiUI-style card flip (per-frame transform vars on the conversation
+   *  column) from here — re-rasterizing a 390×844 card layer every frame
+   *  was far too heavy for phone GPUs (iPhone Air). The scroll-snap motion
+   *  itself is compositor-free; the page mirror is updated at settle time
+   *  (nothing consumes it mid-gesture).
+   *
+   *  The ONE exception: while the third page is live, a rAF-batched check
+   *  flips NEAR_DETAILS_ATTR once the swipe approaches it, so the browser
+   *  starts rendering the (potentially huge, content-visibility:hidden)
+   *  details panel BEFORE it scrolls into view. Clean-style read, guarded
+   *  writes — no layout flush. */
   readonly #onPagerScroll = (): void => {
-    const frame = findFrame()
-    const mobile = this.#mql?.matches ?? false
-    if (frame === null || !mobile) return
-    this.#updateFlipVars(frame)
-    this.#mirrorPage(frame)
+    if (!(this.#mql?.matches ?? false)) return
+    if (!this.#detailsRevealScheduled && this.#detailsPageOpen()) {
+      this.#detailsRevealScheduled = true
+      requestAnimationFrame(() => {
+        this.#detailsRevealScheduled = false
+        if (this.#disposed) return
+        const frame = findFrame()
+        if (frame !== null) this.#syncDetailsReveal(frame)
+      })
+    }
     if (this.#settleTimer !== null) window.clearTimeout(this.#settleTimer)
     this.#settleTimer = window.setTimeout(() => {
       this.#settleTimer = null
       this.#settlePager()
     }, SCROLL_SETTLE_MS)
+  }
+
+  /** Flip NEAR_DETAILS_ATTR on/off from the pager position (see the
+   *  attribute's doc). Called from the rAF-batched scroll path and from
+   *  settle/opt-in/breakpoint handlers — never with dirty style. */
+  readonly #syncDetailsReveal = (frame: HTMLElement): void => {
+    const html = this.#html
+    if (html === null) return
+    const open = (this.#mql?.matches ?? false) && this.#detailsPageOpen()
+    const chatLeft = open ? this.#chatPageLeft(frame) : 0
+    const near = open && chatLeft > 0
+      && frame.scrollLeft > chatLeft + this.#pageWidth(frame) * DETAILS_REVEAL_FRACTION
+    const has = html.hasAttribute(NEAR_DETAILS_ATTR)
+    if (near && !has) html.setAttribute(NEAR_DETAILS_ATTR, '')
+    else if (!near && has) html.removeAttribute(NEAR_DETAILS_ATTR)
   }
 
   /** Record the pointer-down position so #onPagerPointerUp can tell a tap
@@ -976,39 +1163,14 @@ export class MobileController implements MobileControllerHandle {
     this.#supplementTimers.add(timer)
   }
 
-  /** PiUI's flip: progress -1 (sidebar page) … 0 (chat page); the chat card
-   *  rotates about the edge toward the swipe side and shrinks, so on the
-   *  sidebar page it sinks away leaving only a sliver visible. Suppressed
-   *  during programmatic session-switch jumps (see #flipSuppressed); the
-   *  no-op guard also skips style writes when the progress has not actually
-   *  moved between frames. The [data-dshm-flipping] attribute grants the
-   *  card's 3D layer hint only while a flip is live — at rest the
-   *  conversation column is a plain 2D element. */
-  readonly #updateFlipVars = (frame: HTMLElement): void => {
-    if (this.#flipSuppressed) return
-    const chatLeft = this.#chatPageLeft(frame)
-    if (chatLeft <= 0) return
-    const progress = Math.max(-1, Math.min(1, (frame.scrollLeft - chatLeft) / chatLeft))
-    if (this.#lastFlipProgress !== null && Math.abs(progress - this.#lastFlipProgress) < 0.001) return
-    this.#lastFlipProgress = progress
-    this.#setFlipVars(frame, progress)
-    const html = this.#html
-    if (Math.abs(progress) > 0.001) html?.setAttribute('data-dshm-flipping', '')
-    else html?.removeAttribute('data-dshm-flipping')
-  }
-
   readonly #settlePager = (): void => {
-    // A programmatic jump's suppression ends when the pager settles; a user
-    // swipe re-arms this timer via the scroll handler, which also ends it.
-    this.#flipSuppressed = false
     const frame = findFrame()
     const mobile = this.#mql?.matches ?? false
     if (frame === null || !mobile) return
     const chatLeft = this.#chatPageLeft(frame)
     if (chatLeft <= 0) return
     const left = frame.scrollLeft
-    const nearest: MobilePage = left < chatLeft / 2 ? 'sidebar' : 'chat'
-    const target = nearest === 'sidebar' ? 0 : chatLeft
+    const target = this.#nearestPageLeft(frame, left)
     if (Math.abs(left - target) > 4) {
       // INSTANT nudge: a smooth re-snap would animate after the gesture and
       // eat the first tap that lands during it (browsers suppress clicks
@@ -1016,7 +1178,7 @@ export class MobileController implements MobileControllerHandle {
       frame.scrollTo({ left: target, behavior: 'auto' })
     }
     this.#mirrorPage(frame)
-    this.#updateFlipVars(frame)
+    this.#syncDetailsReveal(frame)
   }
 
   /** A tap on the exposed chat card returns to the chat page (PiUI's

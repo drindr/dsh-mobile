@@ -305,3 +305,116 @@ describe('MobileController keyboard inset', () => {
     controller.dispose()
   })
 })
+
+describe('MobileController third page (details opt-in)', () => {
+  const OPT_IN = 'data-dshm-details-page'
+
+  afterEach(() => {
+    document.documentElement.removeAttribute(OPT_IN)
+  })
+
+  /** A frame with the details column present; clientWidth stubbed to 800 so
+   *  the full-width page math has a real page width. The frame keeps its
+   *  data-details-collapsed attribute throughout — AppFrame's computeColumns
+   *  never opens the details track on narrow viewports, so the opt-in alone
+   *  decides the page count. */
+  function makeThreeColFrame(): HTMLElement {
+    const frame = makeFrame()
+    Object.defineProperty(frame, 'clientWidth', { configurable: true, value: 800 })
+    frame.append(document.createElement('div')) // the details column
+    return frame
+  }
+
+  function mountSync(options: MobileControllerOptions) {
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => { cb(0); return 0 })
+    const controller = makeController(options)
+    controller.mount()
+    return controller
+  }
+
+  it('parks on the details page after a left swipe past the midpoint', async () => {
+    stubMatchMedia(true)
+    const frame = makeThreeColFrame()
+    document.documentElement.setAttribute(OPT_IN, '')
+    mountSync({ toggleSidebar: toggleSidebarSpy() })
+    expect(frame.scrollLeft).toBe(300) // still starts on the chat page
+    await new Promise(resolve => setTimeout(resolve, 0))
+    // Swipe left from the chat page (300) toward the details page (1100),
+    // stopping past the midpoint (700): the settle re-snaps to details.
+    frame.scrollLeft = 800
+    frame.dispatchEvent(new Event('scroll'))
+    await flushTimers(250)
+    expect(frame.scrollLeft).toBe(1100)
+    expect(document.documentElement.getAttribute(PAGE_ATTR)).toBe('details')
+  })
+
+  it('stays two pages without the opt-in', async () => {
+    stubMatchMedia(true)
+    const frame = makeThreeColFrame()
+    mountSync({ toggleSidebar: toggleSidebarSpy() })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    frame.scrollLeft = 800
+    frame.dispatchEvent(new Event('scroll'))
+    await flushTimers(250)
+    expect(frame.scrollLeft).toBe(300) // re-snapped to chat, no details target
+    expect(document.documentElement.getAttribute(PAGE_ATTR)).toBe('chat')
+  })
+
+  it('a swipe back right from the details page re-snaps to the chat page', async () => {
+    stubMatchMedia(true)
+    const frame = makeThreeColFrame()
+    document.documentElement.setAttribute(OPT_IN, '')
+    mountSync({ toggleSidebar: toggleSidebarSpy() })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    frame.scrollLeft = 1100 // resting on the details page
+    frame.dispatchEvent(new Event('scroll'))
+    await flushTimers(250)
+    expect(document.documentElement.getAttribute(PAGE_ATTR)).toBe('details')
+    // Swipe right, stopping short of the details midpoint: back to chat.
+    frame.scrollLeft = 600
+    frame.dispatchEvent(new Event('scroll'))
+    await flushTimers(250)
+    expect(frame.scrollLeft).toBe(300)
+    expect(document.documentElement.getAttribute(PAGE_ATTR)).toBe('chat')
+  })
+
+  it('a late opt-in (plugin loads after dsh-mobile) grows the pager live', async () => {
+    stubMatchMedia(true)
+    const frame = makeThreeColFrame()
+    mountSync({ toggleSidebar: toggleSidebarSpy() })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    // Two pages: a far-left offset has no details target yet.
+    frame.scrollLeft = 800
+    frame.dispatchEvent(new Event('scroll'))
+    await flushTimers(250)
+    expect(frame.scrollLeft).toBe(300)
+    // The plugin lands and opts in: the observer re-snaps live.
+    document.documentElement.setAttribute(OPT_IN, '')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    frame.scrollLeft = 800
+    frame.dispatchEvent(new Event('scroll'))
+    await flushTimers(250)
+    expect(frame.scrollLeft).toBe(1100)
+    expect(document.documentElement.getAttribute(PAGE_ATTR)).toBe('details')
+  })
+  it('keeps the details page rendering-skipped until a swipe approaches it', async () => {
+    stubMatchMedia(true)
+    const frame = makeThreeColFrame()
+    document.documentElement.setAttribute(OPT_IN, '')
+    mountSync({ toggleSidebar: toggleSidebarSpy() })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const NEAR = 'data-dshm-near-details'
+    // At rest on the chat page (scrollLeft 300; reveal threshold is
+    // 300 + 800*0.08 = 364): the huge details panel stays hidden.
+    expect(document.documentElement.hasAttribute(NEAR)).toBe(false)
+    // Swipe left toward the details page, past the reveal threshold: the
+    // attribute lands early enough for the panel to paint before arrival.
+    frame.scrollLeft = 500
+    frame.dispatchEvent(new Event('scroll'))
+    expect(document.documentElement.hasAttribute(NEAR)).toBe(true)
+    // Back on the chat page: hidden again (offscreen tax removed).
+    frame.scrollLeft = 300
+    frame.dispatchEvent(new Event('scroll'))
+    expect(document.documentElement.hasAttribute(NEAR)).toBe(false)
+  })
+})
