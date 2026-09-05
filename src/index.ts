@@ -28,7 +28,7 @@
  * harness routes; the plugin id is the stable npm-scoped package name.
  */
 import { readFile } from 'node:fs/promises'
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 
 export const name = 'dsh-mobile'
 export const inject = ['webServer'] as const

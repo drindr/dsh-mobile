@@ -13,17 +13,22 @@
  * slot (ThreadTrail) can opt into a third page right of the chat by setting
  * [data-dshm-details-page] on <html> (see controller.ts).
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
-// Type-only: pulls the layout plugin's Context merge (ctx.layout) and the
-// sessions service surface into this compilation unit.
+// In 0.1.2 the client root context is plain cordis Context (the old client
+// runtime package is gone); service surfaces arrive as declaration merges
+// on '@deepseek-ai/cordis'.
+import type { Context } from '@deepseek-ai/cordis'
+// Type-only: pulls the layout plugin's Context merge (ctx.layout), the
+// session object layer (ctx.sessions), and the uiSession service surface
+// (ctx.uiSession.pendingInteractions) into this compilation unit.
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
-import type {} from '@deepseek-ai/dsh-client-runtime/client'
+import type {} from '@deepseek-ai/dsh-api-session-controller/client'
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import { MobileController, type PendingInteractionInfo } from './controller.ts'
 // Plugin-owned global mobile sheet (injected as a <style data-plugin> tag).
 import './mobile.css'
 
 /** Services required by the mobile plugin. */
-export const inject = ['layout', 'sessions']
+export const inject = ['layout', 'sessions', 'uiSession']
 
 /**
  * Install the mobile surfaces: the DOM controller (one effect). A
@@ -32,7 +37,7 @@ export const inject = ['layout', 'sessions']
  * do not move `current` (running flags, titles) leave it alone.
  * @param ctx - Client root context.
  */
-export function apply(ctx: ClientContext): void {
+export function apply(ctx: Context): void {
   ctx.effect(() => {
     const controller = new MobileController({
       toggleSidebar: () => ctx.layout.toggleSidebar(),
@@ -66,19 +71,27 @@ export function apply(ctx: ClientContext): void {
     /** Surface sessions (other than the current one) that wait on the user —
      *  approval, question, or plan review — as a tappable banner. The app's
      *  own indicator (a tiny dot on a row inside a workspace group) is
-     *  invisible on a phone. */
+     *  invisible on a phone. Pending interactions live on the uiSession
+     *  service (a ReadonlyMap<SessionId, SessionPendingInteraction>), not on
+     *  the list summary — same source the sidebar's dot reads in 0.1.2
+     *  (ui-workspace's visiblePendingKind accepts exactly these kinds). */
     const syncPendingInteraction = (): void => {
       const state = ctx.sessions.list.getSnapshot()
       const current = state.current
+      const pending = ctx.uiSession.pendingInteractions.getSnapshot()
       let info: PendingInteractionInfo | null = null
       let extraCount = 0
-      for (const id of state.ids) {
-        const summary = state.byId[id]
-        const kind = summary?.pendingInteraction
-        if (kind === undefined || summary === undefined) continue
+      for (const [id, interaction] of pending) {
         if (id === current) continue // the current session shows the inline panel
+        const kind = interaction.kind
+        if (kind !== 'approval' && kind !== 'plan-review' && kind !== 'question') continue
         if (info === null) {
-          info = { sessionId: id, title: summary.displayTitle, kind, extraCount: 0 }
+          info = {
+            sessionId: id,
+            title: state.byId[id]?.displayTitle ?? id,
+            kind,
+            extraCount: 0,
+          }
         } else {
           extraCount += 1
         }
@@ -87,6 +100,9 @@ export function apply(ctx: ClientContext): void {
       controller.setPendingInteraction(info)
     }
 
+    const offPending = ctx.uiSession.pendingInteractions.subscribe(() => {
+      syncPendingInteraction()
+    })
     const off = ctx.sessions.list.subscribe(() => {
       syncPendingInteraction()
       const next = ctx.sessions.list.getSnapshot().current
@@ -99,22 +115,20 @@ export function apply(ctx: ClientContext): void {
     /** Foreground recovery for lost pending waits. While the PWA is
      *  backgrounded, iOS can suspend the SSE stream WITHOUT closing it — no
      *  reconnect, so no mux-open replay. approval/question/plan-review frames
-     *  that arrived in that window are never replayed, yet the host-side list
-     *  still advertises the pending interaction (it is host-computed, not
-     *  frame-derived). So "the CURRENT session has a pending interaction but
-     *  no takeover panel is mounted" means the wait was lost: reload to force
-     *  a fresh connection whose mux-open replay re-mints the waits. A replay
-     *  that never lands (the ask was withdrawn server-side) clears the list
-     *  flag after reload, so this cannot loop. */
+     *  that arrived in that window are never replayed. The uiSession pending
+     *  map is re-published from the replayed requests, so "the CURRENT
+     *  session has a pending interaction but no takeover panel is mounted"
+     *  means the panel render was lost: reload to force a fresh connection
+     *  whose mux-open replay re-mints the waits. A replay that never lands
+     *  (the ask was withdrawn server-side) clears the map entry after
+     *  reload, so this cannot loop. */
     const recoverLostPending = (): void => {
       if (document.visibilityState !== 'visible') return
       // Give the app a beat to re-render pending panels after foregrounding.
       window.setTimeout(() => {
-        const state = ctx.sessions.list.getSnapshot()
-        const current = state.current
+        const current = ctx.sessions.list.getSnapshot().current
         if (current === undefined) return
-        const summary = state.byId[current]
-        if (summary?.pendingInteraction === undefined) return
+        if (ctx.uiSession.pendingInteractions.getSnapshot().get(current) === undefined) return
         const panel = document.querySelector(
           '[data-approval-key], [data-question-key], [data-plan-review-key]',
         )
@@ -124,6 +138,7 @@ export function apply(ctx: ClientContext): void {
     }
     document.addEventListener('visibilitychange', recoverLostPending)
     return () => {
+      offPending()
       off()
       document.removeEventListener('visibilitychange', recoverLostPending)
       controller.dispose()

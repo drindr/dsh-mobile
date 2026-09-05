@@ -1,10 +1,8 @@
 // @vitest-environment jsdom
 /** dsh-mobile registration: mounts the controller; returns to chat on session change. */
-import { Context } from 'cordis'
+import { Context } from '@deepseek-ai/cordis'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup } from '@testing-library/react'
-import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
-import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { apply, inject } from '../src/client/index.ts'
 
 /** A MediaQueryList stub (jsdom has none) with a controllable fire(). */
@@ -34,6 +32,14 @@ interface ListCapture {
   subscribe: (fn: () => void) => () => void
 }
 
+/** Minimal uiSession.pendingInteractions stub (HostObservable shape). */
+function pendingStub(entries: ReadonlyMap<string, { key: string; kind: string; sessionId: string }> = new Map()) {
+  return {
+    getSnapshot: () => entries,
+    subscribe: () => () => {},
+  }
+}
+
 beforeEach(() => {
   stubMatchMedia(false)
 })
@@ -47,8 +53,6 @@ afterEach(() => {
 
 async function bench(layout?: unknown, list?: ListCapture) {
   const ctx = new Context()
-  await ctx.plugin(SlotRegistry).await()
-  ctx.provide('locale', new LocaleRuntime(ctx))
   ctx.provide('layout', layout ?? {
     toggleSidebar: vi.fn(),
     openDetails: vi.fn(),
@@ -60,12 +64,15 @@ async function bench(layout?: unknown, list?: ListCapture) {
       subscribe: () => () => {},
     },
   })
+  ctx.provide('uiSession', {
+    pendingInteractions: pendingStub(),
+  })
   return { ctx }
 }
 
 describe('dsh-mobile apply', () => {
   it('declares only the services it uses', () => {
-    expect(inject).toEqual(['layout', 'sessions'])
+    expect(inject).toEqual(['layout', 'sessions', 'uiSession'])
   })
 
   it('mounts the controller and tags <html>', async () => {

@@ -2,7 +2,7 @@
  * tsdown preset for dsh-mobile: an ESM node half with declarations plus a
  * browser half (lib/client.js) wrapped for the harness client-plugin loader.
  * The browser half keeps the loader's platform module table external
- * (react, cordis, ui-slots, web-react, primitives, runtime, layout) and
+ * (react, @deepseek-ai/cordis, client-store, ui-slots, ui-primitives) and
  * inlines everything else. Two CSS channels compile through lightningcss
  * into <style data-plugin> tags injected at factory execution (removed on
  * unload): `.module.css` becomes a hashed class map plus its tag, while a
@@ -17,20 +17,24 @@ import type { UserConfig } from 'tsdown'
 
 const PLUGIN_ID = '@dsh-external/dsh-mobile'
 
-/** Module specifiers the dsh web shell shares into its frozen module table. */
+/** Module specifiers the dsh web shell shares into its frozen module table
+ *  (0.1.2 frontend bootstrap builtins map, see
+ *  dsh-web-frontend/dist/assets/index-*.js: cordis moved under the
+ *  @deepseek-ai scope; web-react and schema-form are gone; client-store is
+ *  new). */
 const PLATFORM_MODULES = [
-  'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', 'cordis',
+  'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
+  '@deepseek-ai/cordis',
+  '@deepseek-ai/dsh-client-store',
   '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-web-react',
   '@deepseek-ai/dsh-client-ui-primitives',
-  '@deepseek-ai/dsh-client-schema-form',
 ] as const
 
-/** Externals resolved from the loader module table. */
+/** Externals resolved from the loader module table. Cross-plugin client
+ *  bundles (the old client-runtime/layout `/client` entries) have no table
+ *  entry in 0.1.2 — collaborate through cordis services instead. */
 const CLIENT_EXTERNALS: readonly string[] = [
   ...PLATFORM_MODULES,
-  '@deepseek-ai/dsh-client-runtime/client',
-  '@deepseek-ai/dsh-client-ui-layout/client',
 ]
 
 const MODULE_CSS_PREFIX = '\0dsh-module-css:'
@@ -63,7 +67,7 @@ export default [
     dts: true,
     clean: true,
     deps: {
-      neverBundle: ['schemastery', 'cordis'],
+      neverBundle: ['schemastery', 'cordis', '@deepseek-ai/cordis'],
     },
   },
   {

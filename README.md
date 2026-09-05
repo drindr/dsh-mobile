@@ -48,16 +48,15 @@ dsh plugin --profile web add link:E:/dev/dsh-mobile
 ## 开发
 
 ```sh
-pnpm install        # devDeps: @deepseek-ai/dsh-client-* 取 npm registry（^0.1.0-rc.6，与发行版对齐），无本机路径
+pnpm install        # devDeps: @deepseek-ai/dsh-client-* 取 npm registry（^0.1.2-rc.1，与发行版对齐），无本机路径
 pnpm run check      # typecheck + test + build
 ```
 
 ```
 src/client/
+  index.ts           # 客户端入口：挂载控制器、待处理交互横幅（ctx.uiSession.pendingInteractions）、前台恢复重载
   controller.ts      # DOM 控制器：viewport meta、翻页镜像、键盘 inset、FAB、选会话回聊天页
   mobile.css         # 全局移动端样式表（<style data-plugin> 注入，卸载即移除）
-  MobileMenuButton.tsx  # 页头 ☰（header.actions 槽位，order -10）
-  locales.ts         # 中英文案
 ```
 
 ## License
