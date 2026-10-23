@@ -39,6 +39,29 @@ export const inject = ['layout', 'sessions', 'uiSession']
  */
 export function apply(ctx: Context): void {
   ctx.effect(() => {
+    // DSH 0.2 exposes pending interactions through the unified status source.
+    // Retain the old source for installations still running DSH 0.1.
+    type SessionKey = keyof ReturnType<typeof ctx.sessions.list.getSnapshot>["byId"]
+    type Pending = { key: string; kind: string; sessionId: SessionKey }
+    type Source<T> = { getSnapshot(): ReadonlyMap<SessionKey, T>; subscribe(fn: () => void): () => void }
+    const ui = ctx.uiSession as unknown as {
+      pendingInteractions?: Source<Pending>
+      sessionStatus?: Source<{ pendingInteraction?: Pending }>
+    }
+    const pendingInteractions: Source<Pending> = ui.pendingInteractions ?? {
+      getSnapshot: () => {
+        if (!ui.sessionStatus) throw new Error('dsh-mobile: missing session status source')
+        const pending = new Map<SessionKey, Pending>()
+        for (const [id, status] of ui.sessionStatus.getSnapshot()) {
+          if (status.pendingInteraction) pending.set(id, status.pendingInteraction)
+        }
+        return pending
+      },
+      subscribe: (fn) => {
+        if (!ui.sessionStatus) throw new Error('dsh-mobile: missing session status source')
+        return ui.sessionStatus.subscribe(fn)
+      },
+    }
     const controller = new MobileController({
       toggleSidebar: () => ctx.layout.toggleSidebar(),
       // One-tap session-switch guarantee: the row's own onClick switches on
@@ -78,7 +101,7 @@ export function apply(ctx: Context): void {
     const syncPendingInteraction = (): void => {
       const state = ctx.sessions.list.getSnapshot()
       const current = state.current
-      const pending = ctx.uiSession.pendingInteractions.getSnapshot()
+      const pending = pendingInteractions.getSnapshot()
       let info: PendingInteractionInfo | null = null
       let extraCount = 0
       for (const [id, interaction] of pending) {
@@ -100,7 +123,7 @@ export function apply(ctx: Context): void {
       controller.setPendingInteraction(info)
     }
 
-    const offPending = ctx.uiSession.pendingInteractions.subscribe(() => {
+    const offPending = pendingInteractions.subscribe(() => {
       syncPendingInteraction()
     })
     const off = ctx.sessions.list.subscribe(() => {
@@ -128,7 +151,7 @@ export function apply(ctx: Context): void {
       window.setTimeout(() => {
         const current = ctx.sessions.list.getSnapshot().current
         if (current === undefined) return
-        if (ctx.uiSession.pendingInteractions.getSnapshot().get(current) === undefined) return
+        if (pendingInteractions.getSnapshot().get(current) === undefined) return
         const panel = document.querySelector(
           '[data-approval-key], [data-question-key], [data-plan-review-key]',
         )

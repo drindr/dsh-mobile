@@ -51,7 +51,7 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-async function bench(layout?: unknown, list?: ListCapture) {
+async function bench(layout?: unknown, list?: ListCapture, uiSession?: unknown) {
   const ctx = new Context()
   ctx.provide('layout', layout ?? {
     toggleSidebar: vi.fn(),
@@ -64,7 +64,7 @@ async function bench(layout?: unknown, list?: ListCapture) {
       subscribe: () => () => {},
     },
   })
-  ctx.provide('uiSession', {
+  ctx.provide('uiSession', uiSession ?? {
     pendingInteractions: pendingStub(),
   })
   return { ctx }
@@ -79,6 +79,25 @@ describe('dsh-mobile apply', () => {
     const b = await bench()
     await b.ctx.plugin({ inject: [...inject], apply }).await()
     expect(document.documentElement.dataset.dshMobile).toBe('')
+  })
+
+  it('supports the DSH 0.2 sessionStatus source and releases its subscription', async () => {
+    const unsubscribe = vi.fn()
+    const subscribe = vi.fn(() => unsubscribe)
+    const b = await bench(undefined, undefined, {
+      sessionStatus: {
+        getSnapshot: () => new Map([['s1', {
+          pendingInteraction: { key: 'q1', kind: 'question', sessionId: 's1' },
+        }]]),
+        subscribe,
+      },
+    })
+    const fiber = b.ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    expect(document.documentElement.dataset.dshMobile).toBe('')
+    expect(subscribe).toHaveBeenCalledOnce()
+    await fiber.dispose()
+    expect(unsubscribe).toHaveBeenCalledOnce()
   })
 
   it('returns to the chat page when the current session changes', async () => {
