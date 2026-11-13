@@ -27,13 +27,13 @@ function stubMatchMedia(matches: boolean): { fire: (next: boolean) => void } {
   }
 }
 
-interface ListCapture {
-  getSnapshot: () => { current: string | undefined; byId: Record<string, unknown> }
+export interface ListCapture {
+  getSnapshot: () => { ids: string[]; byId: Record<string, unknown> }
   subscribe: (fn: () => void) => () => void
 }
 
-/** Minimal uiSession.pendingInteractions stub (HostObservable shape). */
-function pendingStub(entries: ReadonlyMap<string, { key: string; kind: string; sessionId: string }> = new Map()) {
+/** Minimal uiSession.sessionStatus stub (HostObservable shape). */
+function statusStub(entries: ReadonlyMap<string, { pendingInteraction?: { key: string; kind: string; sessionId: string } }> = new Map()) {
   return {
     getSnapshot: () => entries,
     subscribe: () => () => {},
@@ -51,7 +51,7 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-async function bench(layout?: unknown, list?: ListCapture, uiSession?: unknown) {
+async function bench(layout?: unknown, list?: ListCapture) {
   const ctx = new Context()
   ctx.provide('layout', layout ?? {
     toggleSidebar: vi.fn(),
@@ -60,19 +60,22 @@ async function bench(layout?: unknown, list?: ListCapture, uiSession?: unknown) 
   })
   ctx.provide('sessions', {
     list: list ?? {
-      getSnapshot: () => ({ current: undefined, byId: {} }),
+      getSnapshot: () => ({ ids: [], byId: {} }),
       subscribe: () => () => {},
     },
   })
-  ctx.provide('uiSession', uiSession ?? {
-    pendingInteractions: pendingStub(),
+  ctx.provide('uiSession', {
+    sessionStatus: statusStub(),
+  })
+  ctx.provide('uiWorkspace', {
+    openSession: vi.fn(),
   })
   return { ctx }
 }
 
 describe('dsh-mobile apply', () => {
   it('declares only the services it uses', () => {
-    expect(inject).toEqual(['layout', 'sessions', 'uiSession'])
+    expect(inject).toEqual(['layout', 'uiWorkspace', 'sessions', 'uiSession'])
   })
 
   it('mounts the controller and tags <html>', async () => {
@@ -81,30 +84,11 @@ describe('dsh-mobile apply', () => {
     expect(document.documentElement.dataset.dshMobile).toBe('')
   })
 
-  it('supports the DSH 0.2 sessionStatus source and releases its subscription', async () => {
-    const unsubscribe = vi.fn()
-    const subscribe = vi.fn(() => unsubscribe)
-    const b = await bench(undefined, undefined, {
-      sessionStatus: {
-        getSnapshot: () => new Map([['s1', {
-          pendingInteraction: { key: 'q1', kind: 'question', sessionId: 's1' },
-        }]]),
-        subscribe,
-      },
-    })
-    const fiber = b.ctx.plugin({ inject: [...inject], apply })
-    await fiber.await()
-    expect(document.documentElement.dataset.dshMobile).toBe('')
-    expect(subscribe).toHaveBeenCalledOnce()
-    await fiber.dispose()
-    expect(unsubscribe).toHaveBeenCalledOnce()
-  })
-
   it('returns to the chat page when the current session changes', async () => {
     const listeners: Array<() => void> = []
     let current: string | undefined = undefined
     const list: ListCapture = {
-      getSnapshot: () => ({ current, byId: {} }),
+      getSnapshot: () => ({ ids: [], byId: {} }),
       subscribe: (fn) => { listeners.push(fn); return () => { } },
     }
     const b = await bench(undefined, list)

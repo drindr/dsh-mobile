@@ -6,7 +6,8 @@
     "main": "./lib/client.js",
     "inject": [
       "@deepseek-ai/dsh-client-ui-session",
-      "@deepseek-ai/dsh-client-ui-layout"
+      "@deepseek-ai/dsh-client-ui-layout",
+      "@deepseek-ai/dsh-client-ui-workspace"
     ]
   },
   "engines": {
